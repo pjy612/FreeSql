@@ -11,18 +11,42 @@ namespace FreeSql
     /// <summary>
     /// 工作单元管理器
     /// </summary>
-    public class UnitOfWorkManager : IDisposable
+    public interface IUnitOfWorkManager : IDisposable
+    {
+        IFreeSql Orm { get; }
+        /// <summary>
+        /// 当前的工作单元
+        /// </summary>
+        IUnitOfWork Current { get; }
+        /// <summary>
+        /// 将仓储的事务交给我管理
+        /// </summary>
+        /// <param name="repository"></param>
+        void Binding(IBaseRepository repository);
+        /// <summary>
+        /// 创建工作单元
+        /// </summary>
+        /// <param name="propagation">事务传播方式</param>
+        /// <param name="isolationLevel">事务隔离级别</param>
+        /// <returns></returns>
+        IUnitOfWork Begin(Propagation propagation = Propagation.Required, IsolationLevel? isolationLevel = null);
+    }
+
+    /// <summary>
+    /// 工作单元管理器
+    /// </summary>
+    public class UnitOfWorkManager : IUnitOfWorkManager
     {
         internal DbContextScopedFreeSql _ormScoped;
         internal IFreeSql OrmOriginal => _ormScoped?._originalFsql;
         public IFreeSql Orm => _ormScoped;
         List<UowInfo> _rawUows = new List<UowInfo>();
         List<UowInfo> _allUows = new List<UowInfo>();
-        List<RepoInfo> _repos = new List<RepoInfo>();
+        List<BindInfo> _binds = new List<BindInfo>();
 
         public UnitOfWorkManager(IFreeSql fsql)
         {
-            if (fsql == null) throw new ArgumentNullException($"{nameof(UnitOfWorkManager)} 构造参数 {nameof(fsql)} 不能为 null");
+            if (fsql == null) throw new ArgumentNullException(DbContextErrorStrings.UnitOfWorkManager_Construction_CannotBeNull(nameof(UnitOfWorkManager), nameof(fsql)));
             _ormScoped = DbContextScopedFreeSql.Create(fsql, null, () => this.Current);
         }
 
@@ -53,7 +77,7 @@ namespace FreeSql
             {
                 _rawUows.Clear();
                 _allUows.Clear();
-                _repos.Clear();
+                _binds.Clear();
                 GC.SuppressFinalize(this);
             }
         }
@@ -70,14 +94,30 @@ namespace FreeSql
         /// <param name="repository"></param>
         public void Binding(IBaseRepository repository)
         {
-            var repoInfo = new RepoInfo(repository);
+            var bind = new BindInfo(repository);
             repository.UnitOfWork = Current;
-            _repos.Add(repoInfo);
+            if (_binds.Any(a => a.Repository == repository)) return;
+            _binds.Add(bind);
         }
-        void SetAllRepositoryUow()
+        /// <summary>
+        /// 将DbContext的事务交给我管理
+        /// </summary>
+        /// <param name="dbContext"></param>
+        public void Binding(DbContext dbContext)
         {
-            foreach (var repo in _repos)
-                repo.Repository.UnitOfWork = Current ?? repo.OrginalUow;
+            var bind = new BindInfo(dbContext);
+            dbContext._isUseUnitOfWork = false;
+            dbContext.UnitOfWork = Current;
+            if (_binds.Any(a => a.DbContext == dbContext)) return;
+            _binds.Add(bind);
+        }
+        void SetAllBindsUow()
+        {
+            foreach (var bind in _binds)
+            {
+                if (bind.Repository != null) bind.Repository.UnitOfWork = Current ?? bind.OrginalUow;
+                if (bind.DbContext != null) bind.DbContext.UnitOfWork = Current ?? bind.OrginalUow;
+            }
         }
 
         /// <summary>
@@ -92,7 +132,7 @@ namespace FreeSql
             {
                 case Propagation.Required: return FindedUowCreateVirtual() ?? CreateUow(isolationLevel);
                 case Propagation.Supports: return FindedUowCreateVirtual() ?? CreateUowNothing(_allUows.LastOrDefault()?.IsNotSupported ?? false);
-                case Propagation.Mandatory: return FindedUowCreateVirtual() ?? throw new Exception("Propagation_Mandatory: 使用当前事务，如果没有当前事务，就抛出异常");
+                case Propagation.Mandatory: return FindedUowCreateVirtual() ?? throw new Exception(DbContextErrorStrings.Propagation_Mandatory);
                 case Propagation.NotSupported: return CreateUowNothing(true);
                 case Propagation.Never:
                     var isNotSupported = _allUows.LastOrDefault()?.IsNotSupported ?? false;
@@ -100,7 +140,7 @@ namespace FreeSql
                     {
                         for (var a = _rawUows.Count - 1; a >= 0; a--)
                             if (_rawUows[a].Uow.GetOrBeginTransaction(false) != null)
-                                throw new Exception("Propagation_Never: 以非事务方式执行操作，如果当前事务存在则抛出异常");
+                                throw new Exception(DbContextErrorStrings.Propagation_Never);
                     }
                     return CreateUowNothing(isNotSupported);
                 case Propagation.Nested: return CreateUow(isolationLevel);
@@ -120,7 +160,7 @@ namespace FreeSql
                         var uowInfo = new UowInfo(uow, UowInfo.UowType.Virtual, isNotSupported);
                         uow.OnDispose = () => _allUows.Remove(uowInfo);
                         _allUows.Add(uowInfo);
-                        SetAllRepositoryUow();
+                        SetAllBindsUow();
                         return uow;
                     }
             }
@@ -132,7 +172,7 @@ namespace FreeSql
             var uowInfo = new UowInfo(uow, UowInfo.UowType.Nothing, isNotSupported);
             uow.OnDispose = () => _allUows.Remove(uowInfo);
             _allUows.Add(uowInfo);
-            SetAllRepositoryUow();
+            SetAllBindsUow();
             return uow;
         }
         IUnitOfWork CreateUow(IsolationLevel? isolationLevel)
@@ -147,23 +187,29 @@ namespace FreeSql
             {
                 _rawUows.Remove(uowInfo);
                 _allUows.Remove(uowInfo);
-                SetAllRepositoryUow();
+                SetAllBindsUow();
             };
             _rawUows.Add(uowInfo);
             _allUows.Add(uowInfo);
-            SetAllRepositoryUow();
+            SetAllBindsUow();
             return uow;
         }
 
-        class RepoInfo
+        class BindInfo
         {
+            public DbContext DbContext;
             public IBaseRepository Repository;
             public IUnitOfWork OrginalUow;
-            
-            public RepoInfo(IBaseRepository repository)
+
+            public BindInfo(IBaseRepository repository)
             {
                 this.Repository = repository;
                 this.OrginalUow = repository.UnitOfWork;
+            }
+            public BindInfo(DbContext dbContext)
+            {
+                this.DbContext = dbContext;
+                this.OrginalUow = dbContext.UnitOfWork;
             }
         }
         class UowInfo

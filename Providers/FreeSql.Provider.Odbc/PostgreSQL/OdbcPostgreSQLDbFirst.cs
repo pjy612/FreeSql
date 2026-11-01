@@ -23,7 +23,10 @@ namespace FreeSql.Odbc.PostgreSQL
             _commonExpression = commonExpression;
         }
 
+
         public bool IsPg10 => ServerVersion >= 10;
+        public bool IsPg95 { get; private set; }
+        public bool IsPg96 { get; private set; }
         public int ServerVersion
         {
             get
@@ -33,7 +36,9 @@ namespace FreeSql.Odbc.PostgreSQL
                     {
                         try
                         {
-                            _ServerVersionValue = int.Parse(conn.Value.ServerVersion.Split('.')[0]);
+                            _ServerVersionValue = ParsePgVersion(conn.Value.ServerVersion, 10, 0).Item2;
+                            IsPg95 = ParsePgVersion(conn.Value.ServerVersion, 9, 5).Item1;
+                            IsPg96 = ParsePgVersion(conn.Value.ServerVersion, 9, 6).Item1;
                         }
                         catch
                         {
@@ -54,15 +59,21 @@ namespace FreeSql.Odbc.PostgreSQL
             OdbcType ret = OdbcType.VarChar;
             switch (dbtype?.ToLower().TrimStart('_'))
             {
+                case "smallint":
                 case "int2": ret = OdbcType.SmallInt; break;
+                case "integer":
                 case "int4": ret = OdbcType.Int; break;
+                case "bigint":
                 case "int8": ret = OdbcType.BigInt; break;
                 case "numeric": ret = OdbcType.Numeric; break;
+                case "real":
                 case "float4": ret = OdbcType.Real; break;
+                case "double precision":
                 case "float8": ret = OdbcType.Double; break;
                 case "money": ret = OdbcType.Numeric; break;
 
                 case "bpchar": ret = OdbcType.Char; break;
+                case "character varying":
                 case "varchar": ret = OdbcType.VarChar; break;
                 case "text": ret = OdbcType.Text; break;
 
@@ -142,7 +153,7 @@ namespace FreeSql.Odbc.PostgreSQL
             using (var conn = _orm.Ado.MasterPool.Get(TimeSpan.FromSeconds(5)))
             {
                 olddatabase = conn.Value.Database;
-                is96 = PgVersionIs96(conn.Value.ServerVersion);
+                is96 = ParsePgVersion(conn.Value.ServerVersion, 9, 6).Item1;
             }
             string[] tbname = null;
             string[] dbs = database == null || database.Any() == false ? new[] { olddatabase } : database;
@@ -273,7 +284,6 @@ where {loc8.ToString().Replace("a.table_name", "ns.nspname || '.' || c.relname")
                 ds = _orm.Ado.ExecuteArray(CommandType.Text, sql);
                 if (ds == null) return loc1;
 
-                var position = 0;
                 foreach (object[] row in ds)
                 {
                     var object_id = string.Concat(row[0]);
@@ -324,7 +334,7 @@ where {loc8.ToString().Replace("a.table_name", "ns.nspname || '.' || c.relname")
                         Table = loc2[object_id],
                         Comment = comment,
                         DefaultValue = defaultValue,
-                        Position = ++position
+                        Position = attnum
                     });
                     loc3[object_id][column].DbType = this.GetDbType(loc3[object_id][column]);
                     loc3[object_id][column].CsType = this.GetCsTypeInfo(loc3[object_id][column]);
@@ -382,14 +392,14 @@ where {loc8.ToString().Replace("a.table_name", "ns.nspname || '.' || d.relname")
                     if (!indexColumns.TryGetValue(object_id, out loc10))
                         indexColumns.Add(object_id, loc10 = new Dictionary<string, DbIndexInfo>());
                     if (!loc10.TryGetValue(index_id, out loc11))
-                        loc10.Add(index_id, loc11 = new DbIndexInfo());
+                        loc10.Add(index_id, loc11 = new DbIndexInfo { Name = index_id });
                     loc11.Columns.Add(new DbIndexColumnInfo { Column = loc9, IsDesc = is_desc });
                     if (is_unique && !is_primary_key)
                     {
                         if (!uniqueColumns.TryGetValue(object_id, out loc10))
                             uniqueColumns.Add(object_id, loc10 = new Dictionary<string, DbIndexInfo>());
                         if (!loc10.TryGetValue(index_id, out loc11))
-                            loc10.Add(index_id, loc11 = new DbIndexInfo());
+                            loc10.Add(index_id, loc11 = new DbIndexInfo { Name = index_id });
                         loc11.Columns.Add(new DbIndexColumnInfo { Column = loc9, IsDesc = is_desc });
                     }
                 }
@@ -537,13 +547,23 @@ where a.typtype = 'e' and ns.nspname in (SELECT ""schema_name"" FROM information
             return ret.Select(a => new DbEnumInfo { Name = a.Key, Labels = a.Value }).ToList();
         }
 
-        public static bool PgVersionIs96(string serverVersion)
+        public static NativeTuple<bool, int, int> ParsePgVersion(string versionString, int v1, int v2)
         {
-            int[] version = serverVersion.Split('.').Select(a => int.TryParse(a, out var tryint) ? tryint : 0).ToArray();
-            if (version?.Any() != true) return true;
-            if (version[0] > 9) return true;
-            if (version[0] == 9 && version.Length > 1 && version[1] >= 6) return true;
-            return false;
+            int[] version = new int[] { 0, 0 };
+            var vmatch = Regex.Match(versionString, @"(\d+)\.(\d+)");
+            if (vmatch.Success)
+            {
+                version[0] = int.Parse(vmatch.Groups[1].Value);
+                version[1] = int.Parse(vmatch.Groups[2].Value);
+            }
+            else
+            {
+                vmatch = Regex.Match(versionString, @"(\d+)");
+                version[0] = int.Parse(vmatch.Groups[1].Value);
+            }
+            if (version[0] > v1) return NativeTuple.Create(true, version[0], version[1]);
+            if (version[0] == v1 && version[1] >= v2) return NativeTuple.Create(true, version[0], version[1]);
+            return NativeTuple.Create(false, version[0], version[1]);
         }
     }
 }

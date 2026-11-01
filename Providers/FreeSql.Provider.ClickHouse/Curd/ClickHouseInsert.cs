@@ -1,5 +1,5 @@
-﻿using ClickHouse.Client.ADO;
-using ClickHouse.Client.Copy;
+﻿using ClickHouse.Driver.ADO;
+using ClickHouse.Driver.Copy;
 using FreeSql.Internal;
 using FreeSql.Internal.Model;
 using System;
@@ -57,16 +57,7 @@ namespace FreeSql.ClickHouse.Curd
                 {
                     before = new Aop.CurdBeforeEventArgs(_table.Type, _table, Aop.CurdType.Insert, null, _params);
                     _orm.Aop.CurdBeforeHandler?.Invoke(this, before);
-                    using (var conn = _orm.Ado.MasterPool.Get())
-                    {
-                        using var bulkCopyInterface = new ClickHouseBulkCopy(conn.Value as ClickHouseConnection)
-                        {
-                            DestinationTableName = _table.DbName,
-                            BatchSize = _source.Count
-                        };
-                        var data = ToDataTable();
-                        bulkCopyInterface.WriteToServerAsync(data, default).Wait();
-                    }
+                    InternalBulkCopyAsync().ConfigureAwait(false).GetAwaiter().GetResult();
                     return affrows;
                 }
                 catch (Exception ex)
@@ -83,6 +74,31 @@ namespace FreeSql.ClickHouse.Curd
             return base.RawExecuteAffrows();
         }
 
+        internal async Task<int> InternalBulkCopyAsync()
+        {
+            var data = ToDataTable();
+            var columns = new string[_table.ColumnsByPosition.Length];
+            for ( var i = 0; i < columns.Length; i++ )
+            {
+                columns[i] = _table.ColumnsByPosition[i].CsName;
+            }
+            using (var conn = _orm.Ado.MasterPool.Get())
+            {
+                using (var bulkCopyInterface = new ClickHouseBulkCopy(conn.Value as ClickHouseConnection)
+                       {
+                           DestinationTableName = data.TableName,
+                           BatchSize = _source.Count,
+                           ColumnNames =columns
+                })
+                {
+                    await bulkCopyInterface.InitAsync();
+                    await bulkCopyInterface.WriteToServerAsync(data, default);
+                }
+            }
+            return 0;
+              
+        }
+
         private IDictionary<string, object> GetValue<T>(T u, System.Reflection.PropertyInfo[] columns)
         {
             try
@@ -95,11 +111,12 @@ namespace FreeSql.ClickHouse.Curd
                     {
                         v = item.GetValue(u);
                     }
-                    dic.TryAdd(item.Name, v);
+                    if (dic.ContainsKey(item.Name) == false)
+                        dic.Add(item.Name, v);
                 }
                 return dic;
             }
-            catch (Exception e)
+            catch
             {
                 throw;
             }
@@ -167,22 +184,31 @@ namespace FreeSql.ClickHouse.Curd
                 {
                     before = new Aop.CurdBeforeEventArgs(_table.Type, _table, Aop.CurdType.Insert, null, _params);
                     _orm.Aop.CurdBeforeHandler?.Invoke(this, before);
+                    var data = ToDataTable();
+                    var columns = new string[_table.ColumnsByPosition.Length];
+                    for (var i = 0; i < columns.Length; i++)
+                    {
+                        columns[i] = _table.ColumnsByPosition[i].Attribute.Name;
+                    }
                     using (var conn = await _orm.Ado.MasterPool.GetAsync())
                     {
-                        using var bulkCopyInterface = new ClickHouseBulkCopy(conn.Value as ClickHouseConnection)
+                        using (var bulkCopyInterface = new ClickHouseBulkCopy(conn.Value as ClickHouseConnection)
                         {
-                            DestinationTableName = _table.DbName,
-                            BatchSize = _source.Count
-                        };
-                        var data = ToDataTable();
-                        await bulkCopyInterface.WriteToServerAsync(data, default);
+                            DestinationTableName = data.TableName,
+                            BatchSize = _source.Count,
+                            ColumnNames = columns,
+                        })
+                        {
+                            await bulkCopyInterface.InitAsync();
+                            await bulkCopyInterface.WriteToServerAsync(data, default);
+                        }
                     }
                     return affrows;
                 }
                 catch (Exception ex)
                 {
                     exception = ex;
-                    throw ex;
+                    throw;
                 }
                 finally
                 {

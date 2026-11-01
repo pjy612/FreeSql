@@ -55,7 +55,12 @@ namespace FreeSql.Dameng
 
                 case "char(36)": return DmDbType.Char;
             }
-            switch (column.DbTypeText?.ToLower())
+            if (dbfull?.StartsWith("datetime(") == true)
+            {
+				_dicDbToCs.TryAdd(dbfull, _dicDbToCs["timestamp(6)"]);
+				return DmDbType.DateTime;
+            }
+			switch (column.DbTypeText?.ToLower())
             {
                 case "bit":
                     _dicDbToCs.TryAdd(dbfull, _dicDbToCs["number(1)"]);
@@ -160,7 +165,7 @@ namespace FreeSql.Dameng
                     if (dbfull != null) _dicDbToCs.TryAdd(dbfull, _dicDbToCs["nvarchar2(255)"]);
                     return DmDbType.VarChar;
             }
-            throw new NotImplementedException($"未实现 {column.DbTypeTextFull} 类型映射");
+            throw new NotImplementedException(CoreErrorStrings.S_TypeMappingNotImplemented(column.DbTypeTextFull));
         }
 
         static ConcurrentDictionary<string, DbToCs> _dicDbToCs = new ConcurrentDictionary<string, DbToCs>(StringComparer.CurrentCultureIgnoreCase);
@@ -356,7 +361,7 @@ case when a.nullable = 'N' then 0 else 1 end,
 nvl((select 1 from user_sequences where upper(sequence_name)=upper(a.table_name||'_seq_'||a.column_name) and rownum < 2), 0),
 b.comments,
 a.data_default
-from all_tab_cols a
+from all_tab_columns a
 left join all_col_comments b on b.owner = a.owner and b.table_name = a.table_name and b.column_name = a.column_name
 where {(ignoreCase ? "lower(a.owner)" : "a.owner")} in ({databaseIn}) and {loc8}
 ";
@@ -366,8 +371,11 @@ where {(ignoreCase ? "lower(a.owner)" : "a.owner")} in ({databaseIn}) and {loc8}
             var ds2 = new List<object[]>();
             foreach (var row in ds)
             {
+                var table_id = string.Concat(row[0]);
+                if (database.Length == 1) table_id = table_id.Substring(table_id.IndexOf('.') + 1);
+                if (!loc2.ContainsKey(table_id)) continue;
                 var ds2item = new object[9];
-                ds2item[0] = row[0];
+                ds2item[0] = table_id;
                 ds2item[1] = row[1];
                 ds2item[2] = Regex.Replace(string.Concat(row[2]), @"\(\d+\)", "");
                 ds2item[4] = DamengCodeFirst.GetDamengSqlTypeFullName(new object[] { row[1], row[2], row[3], row[4], row[5], row[6] });
@@ -392,10 +400,6 @@ where {(ignoreCase ? "lower(a.owner)" : "a.owner")} in ({databaseIn}) and {loc8}
                 string comment = string.Concat(row[7]);
                 string defaultValue = string.Concat(row[8]);
                 if (max_length == 0) max_length = -1;
-                if (database.Length == 1)
-                {
-                    table_id = table_id.Substring(table_id.IndexOf('.') + 1);
-                }
                 loc3[table_id].Add(column, new DbColumnInfo
                 {
                     Name = column,
@@ -445,8 +449,8 @@ and {(ignoreCase ? "lower(a.table_owner)" : "a.table_owner")} in ({databaseIn}) 
                 bool is_primary_key = string.Concat(row[4]) == "1";
                 bool is_clustered = string.Concat(row[5]) == "1";
                 bool is_desc = string.Concat(row[6]) == "1";
-                if (database.Length == 1)
-                    table_id = table_id.Substring(table_id.IndexOf('.') + 1);
+                if (database.Length == 1) table_id = table_id.Substring(table_id.IndexOf('.') + 1);
+                if (!loc2.ContainsKey(table_id)) continue;
                 if (loc3.ContainsKey(table_id) == false || loc3[table_id].ContainsKey(column) == false) continue;
                 var loc9 = loc3[table_id][column];
                 if (loc9.IsPrimary == false && is_primary_key) loc9.IsPrimary = is_primary_key;
@@ -457,14 +461,14 @@ and {(ignoreCase ? "lower(a.table_owner)" : "a.table_owner")} in ({databaseIn}) 
                 if (!indexColumns.TryGetValue(table_id, out loc10))
                     indexColumns.Add(table_id, loc10 = new Dictionary<string, DbIndexInfo>());
                 if (!loc10.TryGetValue(index_id, out loc11))
-                    loc10.Add(index_id, loc11 = new DbIndexInfo());
+                    loc10.Add(index_id, loc11 = new DbIndexInfo { Name = index_id });
                 loc11.Columns.Add(new DbIndexColumnInfo { Column = loc9, IsDesc = is_desc });
                 if (is_unique && !is_primary_key)
                 {
                     if (!uniqueColumns.TryGetValue(table_id, out loc10))
                         uniqueColumns.Add(table_id, loc10 = new Dictionary<string, DbIndexInfo>());
                     if (!loc10.TryGetValue(index_id, out loc11))
-                        loc10.Add(index_id, loc11 = new DbIndexInfo());
+                        loc10.Add(index_id, loc11 = new DbIndexInfo { Name = index_id });
                     loc11.Columns.Add(new DbIndexColumnInfo { Column = loc9, IsDesc = is_desc });
                 }
             }
@@ -508,15 +512,15 @@ all_constraints b,
 all_cons_columns c, --外键表
 all_cons_columns d  --主键表
 where
-a.r_constraint_name = b.constraint_name
-and a.constraint_type = 'R'
-and b.constraint_type = 'P'
-and a.r_owner = b.owner
-and a.constraint_name = c.constraint_name
-and b.constraint_name = d.constraint_name
-and a.owner = c.owner
-and a.table_name = c.table_name
-and b.owner = d.owner
+a.r_constraint_name = b.constraint_name 　　
+and a.constraint_type = 'R' 　　
+and b.constraint_type = 'P' 　　
+and a.r_owner = b.owner 　　
+and a.constraint_name = c.constraint_name 　　
+and b.constraint_name = d.constraint_name 　　
+and a.owner = c.owner 　　
+and a.table_name = c.table_name 　　
+and b.owner = d.owner 　　
 and b.table_name = d.table_name
 and {(ignoreCase ? "lower(a.owner)" : "a.owner")} in ({databaseIn}) and {loc8}
 ";
@@ -537,9 +541,11 @@ and {(ignoreCase ? "lower(a.owner)" : "a.owner")} in ({databaseIn}) and {loc8}
                         table_id = table_id.Substring(table_id.IndexOf('.') + 1);
                         ref_table_id = ref_table_id.Substring(ref_table_id.IndexOf('.') + 1);
                     }
+                    if (!loc2.ContainsKey(table_id)) continue;
+                    if (!loc2.ContainsKey(ref_table_id)) continue;
                     if (loc3.ContainsKey(table_id) == false || loc3[table_id].ContainsKey(column) == false) continue;
+                    if (loc3.ContainsKey(ref_table_id) == false || loc3[ref_table_id].ContainsKey(referenced_column) == false) continue;
                     var loc9 = loc3[table_id][column];
-                    if (loc2.ContainsKey(ref_table_id) == false) continue;
                     var loc10 = loc2[ref_table_id];
                     var loc11 = loc3[ref_table_id][referenced_column];
 

@@ -1,7 +1,11 @@
 ﻿using FreeSql.DatabaseModel;
 using FreeSql.Internal;
 using FreeSql.Internal.Model;
+#if oledb
+using System.Data.OleDb;
+#else
 using Oracle.ManagedDataAccess.Client;
+#endif
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -25,6 +29,98 @@ namespace FreeSql.Oracle
         }
 
         public int GetDbType(DbColumnInfo column) => (int)GetSqlDbType(column);
+#if oledb
+        OleDbType GetSqlDbType(DbColumnInfo column)
+        {
+            var dbfull = column.DbTypeTextFull?.ToLower();
+            switch (dbfull)
+            {
+                case "number(1)": return OleDbType.Boolean;
+
+                case "number(4)": return OleDbType.TinyInt;
+                case "number(6)": return OleDbType.SmallInt;
+                case "number(11)": return OleDbType.Integer;
+                case "number(21)": return OleDbType.BigInt;
+
+                case "number(3)": return OleDbType.TinyInt;
+                case "number(5)": return OleDbType.Decimal;
+                case "number(10)": return OleDbType.Decimal;
+                case "number(20)": return OleDbType.Decimal;
+
+                case "float(126)": return OleDbType.Double;
+                case "float(63)": return OleDbType.Single;
+                case "number(10,2)": return OleDbType.Decimal;
+
+                case "interval day(2) to second(6)": return OleDbType.DBTime;
+                case "timestamp(6)": return OleDbType.DBTimeStamp;
+                case "timestamp(6) with local time zone": return OleDbType.DBTimeStamp;
+
+                case "blob": return OleDbType.VarBinary;
+                case "nvarchar2(255)": return OleDbType.VarChar;
+
+                case "char(36 char)": return OleDbType.Char;
+            }
+            switch (column.DbTypeText?.ToLower())
+            {
+                case "number":
+                    _dicDbToCs.TryAdd(dbfull, _dicDbToCs["number(10,2)"]);
+                    return OleDbType.Decimal;
+                case "float":
+                    _dicDbToCs.TryAdd(dbfull, _dicDbToCs["float(126)"]);
+                    return OleDbType.Double;
+                case "interval day to second":
+                    _dicDbToCs.TryAdd(dbfull, _dicDbToCs["interval day(2) to second(6)"]);
+                    return OleDbType.DBTime;
+                case "date":
+                    _dicDbToCs.TryAdd(dbfull, _dicDbToCs["date"]);
+                    return OleDbType.DBTimeStamp;
+                case "timestamp":
+                    _dicDbToCs.TryAdd(dbfull, _dicDbToCs["timestamp(6)"]);
+                    return OleDbType.DBTimeStamp;
+                case "timestamp with local time zone":
+                    _dicDbToCs.TryAdd(dbfull, _dicDbToCs["timestamp(6) with local time zone"]);
+                    return OleDbType.DBTimeStamp;
+                case "blob":
+                    _dicDbToCs.TryAdd(dbfull, _dicDbToCs["blob"]);
+                    return OleDbType.VarBinary;
+                case "nvarchar2":
+                    _dicDbToCs.TryAdd(dbfull, _dicDbToCs["nvarchar2(255)"]);
+                    return OleDbType.VarChar;
+                case "varchar2":
+                    _dicDbToCs.TryAdd(dbfull, _dicDbToCs["nvarchar2(255)"]);
+                    return OleDbType.VarChar;
+                case "char":
+                    _dicDbToCs.TryAdd(dbfull, _dicDbToCs["nvarchar2(255)"]);
+                    return OleDbType.Char;
+                case "nchar":
+                    _dicDbToCs.TryAdd(dbfull, _dicDbToCs["nvarchar2(255)"]);
+                    return OleDbType.Char;
+                case "clob":
+                    _dicDbToCs.TryAdd(dbfull, _dicDbToCs["nvarchar2(255)"]);
+                    return OleDbType.VarChar;
+                case "nclob":
+                    _dicDbToCs.TryAdd(dbfull, _dicDbToCs["nvarchar2(255)"]);
+                    return OleDbType.VarChar;
+                case "raw":
+                    _dicDbToCs.TryAdd(dbfull, _dicDbToCs["blob"]);
+                    return OleDbType.VarBinary;
+                case "long raw":
+                    _dicDbToCs.TryAdd(dbfull, _dicDbToCs["blob"]);
+                    return OleDbType.LongVarBinary;
+                case "binary_float":
+                    _dicDbToCs.TryAdd(dbfull, _dicDbToCs["float(63)"]);
+                    return OleDbType.Single;
+                case "binary_double":
+                    _dicDbToCs.TryAdd(dbfull, _dicDbToCs["float(126)"]);
+                    return OleDbType.Double;
+                case "rowid":
+                default:
+                    if (dbfull != null) _dicDbToCs.TryAdd(dbfull, _dicDbToCs["nvarchar2(255)"]);
+                    return OleDbType.VarChar;
+            }
+            throw new NotImplementedException(CoreErrorStrings.S_TypeMappingNotImplemented(column.DbTypeTextFull));
+        }
+#else
         OracleDbType GetSqlDbType(DbColumnInfo column)
         {
             var dbfull = column.DbTypeTextFull?.ToLower();
@@ -113,8 +209,9 @@ namespace FreeSql.Oracle
                     if (dbfull != null) _dicDbToCs.TryAdd(dbfull, _dicDbToCs["nvarchar2(255)"]);
                     return OracleDbType.NVarchar2;
             }
-            throw new NotImplementedException($"未实现 {column.DbTypeTextFull} 类型映射");
+            throw new NotImplementedException(CoreErrorStrings.S_TypeMappingNotImplemented(column.DbTypeTextFull));
         }
+#endif
 
         static ConcurrentDictionary<string, DbToCs> _dicDbToCs = new ConcurrentDictionary<string, DbToCs>(StringComparer.CurrentCultureIgnoreCase);
         static OracleDbFirst()
@@ -254,7 +351,7 @@ where {(ignoreCase ? "lower(a.owner)" : "a.owner")} in ({databaseIn}){(tbname ==
                 if (database.Length == 1)
                 {
                     table_id = table_id.Substring(table_id.IndexOf('.') + 1);
-                    schema = "";
+                    //schema = "";
                 }
                 loc2.Add(table_id, new DbTableInfo { Id = table_id, Schema = schema, Name = table, Comment = comment, Type = type });
                 loc3.Add(table_id, new Dictionary<string, DbColumnInfo>());
@@ -331,7 +428,7 @@ to_char(b.comments),
 nvl(FREESQL_LONG_TO_CHAR_DEFAULT(a.table_name, a.column_name),'')
 from all_tab_cols a
 left join all_col_comments b on b.owner = a.owner and b.table_name = a.table_name and b.column_name = a.column_name
-where {(ignoreCase ? "lower(a.owner)" : "a.owner")} in ({databaseIn}) and {loc8} and a.column_id is not null
+where {(ignoreCase ? "lower(a.owner)" : "a.owner")} in ({databaseIn}){(loc2.Count <= 10 ? $" and {loc8}" : "")} and a.column_id is not null
 ";
             ds = _orm.Ado.ExecuteArray(CommandType.Text, sql);
             if (ds == null) return loc1;
@@ -339,8 +436,11 @@ where {(ignoreCase ? "lower(a.owner)" : "a.owner")} in ({databaseIn}) and {loc8}
             var ds2 = new List<object[]>();
             foreach (var row in ds)
             {
+                var table_id = string.Concat(row[0]);
+                if (database.Length == 1) table_id = table_id.Substring(table_id.IndexOf('.') + 1);
+                if (!loc2.ContainsKey(table_id)) continue;
                 var ds2item = new object[9];
-                ds2item[0] = row[0];
+                ds2item[0] = table_id;
                 ds2item[1] = row[1];
                 ds2item[2] = Regex.Replace(string.Concat(row[2]), @"\(\d+\)", "");
                 ds2item[4] = OracleCodeFirst.GetOracleSqlTypeFullName(new object[] { row[1], row[2], row[3], row[4], row[5], row[6] });
@@ -365,10 +465,6 @@ where {(ignoreCase ? "lower(a.owner)" : "a.owner")} in ({databaseIn}) and {loc8}
                 string comment = string.Concat(row[7]);
                 string defaultValue = string.Concat(row[8]);
                 if (max_length == 0) max_length = -1;
-                if (database.Length == 1)
-                {
-                    table_id = table_id.Substring(table_id.IndexOf('.') + 1);
-                }
                 loc3[table_id].Add(column, new DbColumnInfo
                 {
                     Name = column,
@@ -403,7 +499,7 @@ all_ind_columns c
 where a.index_name = c.index_name
 and a.table_owner = c.table_owner
 and a.table_name = c.table_name
-and {(ignoreCase ? "lower(a.table_owner)" : "a.table_owner")} in ({databaseIn}) and {loc8}
+and {(ignoreCase ? "lower(a.table_owner)" : "a.table_owner")} in ({databaseIn}){(loc2.Count <= 10 ? $" and {loc8}" : "")}
 ";
             ds = _orm.Ado.ExecuteArray(CommandType.Text, sql);
             if (ds == null) return loc1;
@@ -419,8 +515,8 @@ and {(ignoreCase ? "lower(a.table_owner)" : "a.table_owner")} in ({databaseIn}) 
                 bool is_primary_key = string.Concat(row[4]) == "1";
                 bool is_clustered = string.Concat(row[5]) == "1";
                 bool is_desc = string.Concat(row[6]) == "1";
-                if (database.Length == 1)
-                    table_id = table_id.Substring(table_id.IndexOf('.') + 1);
+                if (database.Length == 1) table_id = table_id.Substring(table_id.IndexOf('.') + 1);
+                if (!loc2.ContainsKey(table_id)) continue;
                 if (loc3.ContainsKey(table_id) == false || loc3[table_id].ContainsKey(column) == false) continue;
                 var loc9 = loc3[table_id][column];
                 if (loc9.IsPrimary == false && is_primary_key) loc9.IsPrimary = is_primary_key;
@@ -431,14 +527,14 @@ and {(ignoreCase ? "lower(a.table_owner)" : "a.table_owner")} in ({databaseIn}) 
                 if (!indexColumns.TryGetValue(table_id, out loc10))
                     indexColumns.Add(table_id, loc10 = new Dictionary<string, DbIndexInfo>());
                 if (!loc10.TryGetValue(index_id, out loc11))
-                    loc10.Add(index_id, loc11 = new DbIndexInfo());
+                    loc10.Add(index_id, loc11 = new DbIndexInfo { Name = index_id });
                 loc11.Columns.Add(new DbIndexColumnInfo { Column = loc9, IsDesc = is_desc });
                 if (is_unique && !is_primary_key)
                 {
                     if (!uniqueColumns.TryGetValue(table_id, out loc10))
                         uniqueColumns.Add(table_id, loc10 = new Dictionary<string, DbIndexInfo>());
                     if (!loc10.TryGetValue(index_id, out loc11))
-                        loc10.Add(index_id, loc11 = new DbIndexInfo());
+                        loc10.Add(index_id, loc11 = new DbIndexInfo { Name = index_id });
                     loc11.Columns.Add(new DbIndexColumnInfo { Column = loc9, IsDesc = is_desc });
                 }
             }
@@ -492,7 +588,7 @@ and a.owner = c.owner 　　
 and a.table_name = c.table_name 　　
 and b.owner = d.owner 　　
 and b.table_name = d.table_name
-and {(ignoreCase ? "lower(a.owner)" : "a.owner")} in ({databaseIn}) and {loc8}
+and {(ignoreCase ? "lower(a.owner)" : "a.owner")} in ({databaseIn}){(loc2.Count <= 10 ? $" and {loc8}" : "")}
 ";
                 ds = _orm.Ado.ExecuteArray(CommandType.Text, sql);
                 if (ds == null) return loc1;
@@ -511,9 +607,11 @@ and {(ignoreCase ? "lower(a.owner)" : "a.owner")} in ({databaseIn}) and {loc8}
                         table_id = table_id.Substring(table_id.IndexOf('.') + 1);
                         ref_table_id = ref_table_id.Substring(ref_table_id.IndexOf('.') + 1);
                     }
+                    if (!loc2.ContainsKey(table_id)) continue;
+                    if (!loc2.ContainsKey(ref_table_id)) continue;
                     if (loc3.ContainsKey(table_id) == false || loc3[table_id].ContainsKey(column) == false) continue;
+                    if (loc3.ContainsKey(ref_table_id) == false || loc3[ref_table_id].ContainsKey(referenced_column) == false) continue;
                     var loc9 = loc3[table_id][column];
-                    if (loc2.ContainsKey(ref_table_id) == false) continue;
                     var loc10 = loc2[ref_table_id];
                     var loc11 = loc3[ref_table_id][referenced_column];
 

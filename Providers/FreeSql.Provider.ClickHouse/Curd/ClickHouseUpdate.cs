@@ -7,6 +7,7 @@ using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using DateTime = System.DateTime;
 
 namespace FreeSql.ClickHouse.Curd
 {
@@ -27,8 +28,10 @@ namespace FreeSql.ClickHouse.Curd
         internal void InternalToSqlCaseWhenEnd(StringBuilder sb, ColumnInfo col) => ToSqlCaseWhenEnd(sb, col);
 
         public override int ExecuteAffrows() => SplitExecuteAffrows(_batchRowsLimit > 0 ? _batchRowsLimit : 500, _batchParameterLimit > 0 ? _batchParameterLimit : 3000);
-        public override List<T1> ExecuteUpdated() => SplitExecuteUpdated(_batchRowsLimit > 0 ? _batchRowsLimit : 500, _batchParameterLimit > 0 ? _batchParameterLimit : 3000);
-        protected override List<T1> RawExecuteUpdated() => throw new NotImplementedException("FreeSql.ClickHouse.Custom 未实现该功能 未实现该功能");
+		protected override List<TReturn> ExecuteUpdated<TReturn>(IEnumerable<ColumnInfo> columns) => base.SplitExecuteUpdated<TReturn>(_batchRowsLimit > 0 ? _batchRowsLimit : 500, _batchParameterLimit > 0 ? _batchParameterLimit : 3000, columns);
+
+		protected override List<TReturn> RawExecuteUpdated<TReturn>(IEnumerable<ColumnInfo> columns) => throw new NotImplementedException($"FreeSql.Provider.ClickHouse {CoreErrorStrings.S_Not_Implemented_Feature}");
+
         protected override void ToSqlCase(StringBuilder caseWhen, ColumnInfo[] primarys)
         {
             if (primarys.Length == 1)
@@ -68,6 +71,7 @@ namespace FreeSql.ClickHouse.Curd
         public override void ToSqlExtension110(StringBuilder sb, bool isAsTableSplited)
         {
             if (_where.Length == 0 && _source.Any() == false) return;
+            if (_source.Any() == false && _set.Length == 0 && _setIncr.Length == 0) return;
 
             if (_table.AsTableImpl != null && isAsTableSplited == false && _source == _sourceOld && _source.Any())
             {
@@ -164,6 +168,14 @@ namespace FreeSql.ClickHouse.Curd
 
                                 var colsql = _noneParameter ? _commonUtils.GetNoneParamaterSqlValue(_paramsSource, "u", col, col.Attribute.MapType, val) :
                                     _commonUtils.QuoteWriteParamterAdapter(col.Attribute.MapType, _commonUtils.QuoteParamterName($"p_{_paramsSource.Count}"));
+
+                                //判断是否是DateTime类型，如果是DateTime类型，需要转换成ClickHouse支持的时间格式 #1813
+                                if (col.Attribute.MapType == typeof(DateTime) || col.Attribute.MapType == typeof(DateTime?) )
+                                {
+                                    //获取当前实时区
+                                    colsql = $"toDateTime({colsql},'Asia/Shanghai')";
+                                }
+
                                 cwsb.Append(_commonUtils.RewriteColumn(col, colsql));
                                 if (_noneParameter == false)
                                     _commonUtils.AppendParamter(_paramsSource, null, col, col.Attribute.MapType, val);
@@ -188,13 +200,19 @@ namespace FreeSql.ClickHouse.Curd
                 return;
 
             if (_setIncr.Length > 0)
-                sb.Append(_set.Length > 0 ? _setIncr.ToString() : _setIncr.ToString().Substring(2));
+                sb.Append(_set.Length > 0 || _source.Any() ? _setIncr.ToString() : _setIncr.ToString().Substring(2));
 
             if (_source.Any() == false)
             {
+                var sbString = "";
                 foreach (var col in _table.Columns.Values)
                     if (col.Attribute.CanUpdate && string.IsNullOrEmpty(col.DbUpdateValue) == false)
-                        sb.Append(", ").Append(_commonUtils.QuoteSqlName(col.Attribute.Name)).Append(" = ").Append(col.DbUpdateValue);
+                    {
+                        if (sbString == "") sbString = sb.ToString();
+                        var loc3 = _commonUtils.QuoteSqlName(col.Attribute.Name);
+                        if (sbString.Contains(loc3)) continue;
+                        sb.Append(", ").Append(loc3).Append(" = ").Append(col.DbUpdateValue);
+                    }
             }
 
             if (_table.VersionColumn != null)
@@ -205,6 +223,14 @@ namespace FreeSql.ClickHouse.Curd
                     _updateVersionValue = Utils.GuidToBytes(Guid.NewGuid());
                     sb.Append(", ").Append(vcname).Append(" = ").Append(_commonUtils.GetNoneParamaterSqlValue(_paramsSource, "uv", _table.VersionColumn, _table.VersionColumn.Attribute.MapType, _updateVersionValue));
                 }
+                else if (_versionColumn.Attribute.MapType == typeof(string))
+                {
+                    _updateVersionValue = Guid.NewGuid().ToString();
+                    sb.Append(", ").Append(vcname).Append(" = ").Append(_noneParameter ? _commonUtils.GetNoneParamaterSqlValue(_paramsSource, "uv", _versionColumn, _versionColumn.Attribute.MapType, _updateVersionValue) :
+                        _commonUtils.QuoteWriteParamterAdapter(_versionColumn.Attribute.MapType, _commonUtils.QuoteParamterName($"p_{_paramsSource.Count}")));
+                    if (_noneParameter == false)
+                        _commonUtils.AppendParamter(_paramsSource, null, _versionColumn, _versionColumn.Attribute.MapType, _updateVersionValue);
+                }
                 else
                     sb.Append(", ").Append(vcname).Append(" = ").Append(_commonUtils.IsNull(vcname, 0)).Append(" + 1");
             }
@@ -213,167 +239,84 @@ namespace FreeSql.ClickHouse.Curd
             return;
         }
 
-        protected override int SplitExecuteAffrows(int valuesLimit, int parameterLimit)
-        {
-            var ss = base.SplitSource(valuesLimit, parameterLimit);
-            var ret = 0;
-            if (ss.Length <= 1)
-            {
-                if (_source?.Any() == true) _batchProgress?.Invoke(new BatchProgressStatus<T1>(_source, 1, 1));
-                ret = this.RawExecuteAffrows();
-                ClearData();
-                return ret;
-            }
+		protected override void SplitExecute(int valuesLimit, int parameterLimit, string traceName, Action execute)
+		{
+			var ss = SplitSource(valuesLimit, parameterLimit);
+			if (ss.Length <= 1)
+			{
+				if (_source?.Any() == true) _batchProgress?.Invoke(new BatchProgressStatus<T1>(_source, 1, 1));
+				execute();
+				ClearData();
+				return;
+			}
 
-            var before = new Aop.TraceBeforeEventArgs("SplitExecuteAffrows", null);
-            _orm.Aop.TraceBeforeHandler?.Invoke(this, before);
-            Exception exception = null;
-            try
-            {
-                for (var a = 0; a < ss.Length; a++)
-                {
-                    _source = ss[a];
-                    _batchProgress?.Invoke(new BatchProgressStatus<T1>(_source, a + 1, ss.Length));
-                    ret += this.RawExecuteAffrows();
-                }
-            }
-            catch (Exception ex)
-            {
-                exception = ex;
-                throw;
-            }
-            finally
-            {
-                var after = new Aop.TraceAfterEventArgs(before, null, exception);
-                _orm.Aop.TraceAfterHandler?.Invoke(this, after);
-            }
-            ClearData();
-            return ret;
-        }
-        protected override List<T1> SplitExecuteUpdated(int valuesLimit, int parameterLimit)
-        {
-            var ss = SplitSource(valuesLimit, parameterLimit);
-            var ret = new List<T1>();
-            if (ss.Length <= 1)
-            {
-                if (_source?.Any() == true) _batchProgress?.Invoke(new BatchProgressStatus<T1>(_source, 1, 1));
-                ret = this.RawExecuteUpdated();
-                ClearData();
-                return ret;
-            }
-
-            var before = new Aop.TraceBeforeEventArgs("SplitExecuteUpdated", null);
-            _orm.Aop.TraceBeforeHandler?.Invoke(this, before);
-            Exception exception = null;
-            try
-            {
-                for (var a = 0; a < ss.Length; a++)
-                {
-                    _source = ss[a];
-                    _batchProgress?.Invoke(new BatchProgressStatus<T1>(_source, a + 1, ss.Length));
-                    ret.AddRange(this.RawExecuteUpdated());
-                }
-            }
-            catch (Exception ex)
-            {
-                exception = ex;
-                throw;
-            }
-            finally
-            {
-                var after = new Aop.TraceAfterEventArgs(before, null, exception);
-                _orm.Aop.TraceAfterHandler?.Invoke(this, after);
-            }
-            ClearData();
-            return ret;
-        }
-
+			var before = new Aop.TraceBeforeEventArgs(traceName, null);
+			_orm.Aop.TraceBeforeHandler?.Invoke(this, before);
+			Exception exception = null;
+			try
+			{
+				for (var a = 0; a < ss.Length; a++)
+				{
+					_source = ss[a];
+					_batchProgress?.Invoke(new BatchProgressStatus<T1>(_source, a + 1, ss.Length));
+					execute();
+				}
+			}
+			catch (Exception ex)
+			{
+				exception = ex;
+				throw;
+			}
+			finally
+			{
+				var after = new Aop.TraceAfterEventArgs(before, null, exception);
+				_orm.Aop.TraceAfterHandler?.Invoke(this, after);
+			}
+			ClearData();
+		}
 
 #if net40
 #else
         public override Task<int> ExecuteAffrowsAsync(CancellationToken cancellationToken = default) => SplitExecuteAffrowsAsync(_batchRowsLimit > 0 ? _batchRowsLimit : 500, _batchParameterLimit > 0 ? _batchParameterLimit : 3000, cancellationToken);
-        public override Task<List<T1>> ExecuteUpdatedAsync(CancellationToken cancellationToken = default) => SplitExecuteUpdatedAsync(_batchRowsLimit > 0 ? _batchRowsLimit : 500, _batchParameterLimit > 0 ? _batchParameterLimit : 3000, cancellationToken);
-        protected override Task<List<T1>> RawExecuteUpdatedAsync(CancellationToken cancellationToken = default) => throw new NotImplementedException("FreeSql.ClickHouse.Custom 未实现该功能 未实现该功能");
+		protected override Task<List<TReturn>> ExecuteUpdatedAsync<TReturn>(IEnumerable<ColumnInfo> columns, CancellationToken cancellationToken = default) => base.SplitExecuteUpdatedAsync<TReturn>(_batchRowsLimit > 0 ? _batchRowsLimit : 500, _batchParameterLimit > 0 ? _batchParameterLimit : 3000, columns, cancellationToken);
 
-        async protected override Task<int> SplitExecuteAffrowsAsync(int valuesLimit, int parameterLimit, CancellationToken cancellationToken = default)
-        
-        {
-            var ss = SplitSource(valuesLimit, parameterLimit);
-            var ret = 0;
-            if (ss.Length <= 1)
-            {
-                if (_source?.Any() == true) _batchProgress?.Invoke(new BatchProgressStatus<T1>(_source, 1, 1));
-                await this.RawExecuteAffrowsAsync(cancellationToken);
-                ret = _source.Count;
-                ClearData();
-                return ret;
-            }
+		protected override Task<List<TReturn>> RawExecuteUpdatedAsync<TReturn>(IEnumerable<ColumnInfo> columns, CancellationToken cancellationToken = default) => throw new NotImplementedException($"FreeSql.Provider.ClickHouse {CoreErrorStrings.S_Not_Implemented_Feature}");
 
+		async protected override Task SplitExecuteAsync(int valuesLimit, int parameterLimit, string traceName, Func<Task> executeAsync, CancellationToken cancellationToken = default)
+		{
+			var ss = SplitSource(valuesLimit, parameterLimit);
+			if (ss.Length <= 1)
+			{
+				if (_source?.Any() == true) _batchProgress?.Invoke(new BatchProgressStatus<T1>(_source, 1, 1));
+				await executeAsync();
+				ClearData();
+				return;
+			}
 
-            var before = new Aop.TraceBeforeEventArgs("SplitExecuteAffrowsAsync", null);
-            _orm.Aop.TraceBeforeHandler?.Invoke(this, before);
-            Exception exception = null;
-            try
-            {
-                for (var a = 0; a < ss.Length; a++)
-                {
-                    _source = ss[a];
-                    _batchProgress?.Invoke(new BatchProgressStatus<T1>(_source, a + 1, ss.Length));
-                    await this.RawExecuteAffrowsAsync(cancellationToken);
-                    ret += _source.Count;
-                }
-            }
-            catch (Exception ex)
-            {
-                exception = ex;
-                throw;
-            }
-            finally
-            {
-                var after = new Aop.TraceAfterEventArgs(before, null, exception);
-                _orm.Aop.TraceAfterHandler?.Invoke(this, after);
-            }
-            ClearData();
-            return ret;
-        }
-        async protected override Task<List<T1>> SplitExecuteUpdatedAsync(int valuesLimit, int parameterLimit, CancellationToken cancellationToken = default)
-        {
-            var ss = SplitSource(valuesLimit, parameterLimit);
-            var ret = new List<T1>();
-            if (ss.Length <= 1)
-            {
-                if (_source?.Any() == true) _batchProgress?.Invoke(new BatchProgressStatus<T1>(_source, 1, 1));
-                ret = await this.RawExecuteUpdatedAsync(cancellationToken);
-                ClearData();
-                return ret;
-            }
-
-            var before = new Aop.TraceBeforeEventArgs("SplitExecuteUpdatedAsync", null);
-            _orm.Aop.TraceBeforeHandler?.Invoke(this, before);
-            Exception exception = null;
-            try
-            {
-                for (var a = 0; a < ss.Length; a++)
-                {
-                    _source = ss[a];
-                    _batchProgress?.Invoke(new BatchProgressStatus<T1>(_source, a + 1, ss.Length));
-                    ret.AddRange(await this.RawExecuteUpdatedAsync(cancellationToken));
-                }
-            }
-            catch (Exception ex)
-            {
-                exception = ex;
-                throw;
-            }
-            finally
-            {
-                var after = new Aop.TraceAfterEventArgs(before, null, exception);
-                _orm.Aop.TraceAfterHandler?.Invoke(this, after);
-            }
-            ClearData();
-            return ret;
-        }
-
+			var before = new Aop.TraceBeforeEventArgs(traceName, null);
+			_orm.Aop.TraceBeforeHandler?.Invoke(this, before);
+			Exception exception = null;
+			try
+			{
+				for (var a = 0; a < ss.Length; a++)
+				{
+					_source = ss[a];
+					_batchProgress?.Invoke(new BatchProgressStatus<T1>(_source, a + 1, ss.Length));
+					await executeAsync();
+				}
+			}
+			catch (Exception ex)
+			{
+				exception = ex;
+				throw;
+			}
+			finally
+			{
+				var after = new Aop.TraceAfterEventArgs(before, null, exception);
+				_orm.Aop.TraceAfterHandler?.Invoke(this, after);
+			}
+			ClearData();
+		}
 #endif
-    }
+	}
 }

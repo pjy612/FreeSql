@@ -11,15 +11,21 @@ namespace FreeSql.ClickHouse.Curd
 
     class ClickHouseSelect<T1> : FreeSql.Internal.CommonProvider.Select1Provider<T1>
     {
+        public string _limitBy = "";
+        public string _sample = "";
 
-        internal static string ToSqlStatic(CommonUtils _commonUtils, CommonExpression _commonExpression, string _select, bool _distinct, string field, StringBuilder _join, StringBuilder _where, string _groupby, string _having, string _orderby, int _skip, int _limit, List<SelectTableInfo> _tables, List<Dictionary<Type, string>> tbUnions, Func<Type, string, string> _aliasRule, string _tosqlAppendContent, List<GlobalFilter.Item> _whereGlobalFilter, IFreeSql _orm)
+        internal static string ToSqlStatic(CommonUtils _commonUtils, CommonExpression _commonExpression, string _select, bool _distinct, string field, StringBuilder _join, StringBuilder _where, string _groupby, string _having, string _orderby, int _skip, int _limit, List<SelectTableInfo> _tables, List<Dictionary<Type, string>> tbUnions, Func<Type, string, string> _aliasRule, string _tosqlAppendContent, List<GlobalFilter.Item> _whereGlobalFilter, IFreeSql _orm,
+            string _limitBy = "", string _sample = "")
         {
             if (_orm.CodeFirst.IsAutoSyncStructure)
                 _orm.CodeFirst.SyncStructure(_tables.Select(a => a.Table.Type).ToArray());
 
             if (_whereGlobalFilter.Any())
                 foreach (var tb in _tables.Where(a => a.Type != SelectTableInfoType.Parent))
-                    tb.Cascade = _commonExpression.GetWhereCascadeSql(tb, _whereGlobalFilter, true);
+                {
+                    tb.Cascade = _commonExpression.GetWhereCascadeSql(tb, _whereGlobalFilter.Where(a => a.Before == false), true);
+                    tb.CascadeBefore = _commonExpression.GetWhereCascadeSql(tb, _whereGlobalFilter.Where(a => a.Before == true), true);
+                }
 
             var sb = new StringBuilder();
             var tbUnionsGt0 = tbUnions.Count > 1;
@@ -33,7 +39,7 @@ namespace FreeSql.ClickHouse.Curd
                 sb.Append(_select);
                 if (_distinct) sb.Append("DISTINCT ");
                 sb.Append(field).Append(" \r\nFROM ");
-                var tbsjoin = _tables.Where(a => a.Type != SelectTableInfoType.From).ToArray();
+                var tbsjoin = _tables.Where(a => a.Type != SelectTableInfoType.From && a.Type != SelectTableInfoType.Parent && a.Type != SelectTableInfoType.WithoutJoin).ToArray();
                 var tbsfrom = _tables.Where(a => a.Type == SelectTableInfoType.From).ToArray();
                 for (var a = 0; a < tbsfrom.Length; a++)
                 {
@@ -43,54 +49,64 @@ namespace FreeSql.ClickHouse.Curd
                         //如果存在 join 查询，则处理 from t1, t2 改为 from t1 inner join t2 on 1 = 1
                         for (var b = 1; b < tbsfrom.Length; b++)
                         {
-                            sb.Append(" \r\nLEFT JOIN ").Append(_commonUtils.QuoteSqlName(tbUnion[tbsfrom[b].Table.Type])).Append(" ").Append(_aliasRule?.Invoke(tbsfrom[b].Table.Type, tbsfrom[b].Alias) ?? tbsfrom[b].Alias);
+                            sb.Append(" \r\nGLOBAL LEFT JOIN ").Append(_commonUtils.QuoteSqlName(tbUnion[tbsfrom[b].Table.Type])).Append(" ").Append(_aliasRule?.Invoke(tbsfrom[b].Table.Type, tbsfrom[b].Alias) ?? tbsfrom[b].Alias);
 
-                            if (string.IsNullOrEmpty(tbsfrom[b].NavigateCondition) && string.IsNullOrEmpty(tbsfrom[b].On) && string.IsNullOrEmpty(tbsfrom[b].Cascade)) sb.Append(" ON 1 = 1");
-                            else
-                            {
-                                var onSql = tbsfrom[b].NavigateCondition ?? tbsfrom[b].On;
-                                sb.Append(" ON ").Append(onSql);
-                                if (string.IsNullOrEmpty(tbsfrom[b].Cascade) == false)
+                            if (string.IsNullOrEmpty(tbsfrom[b].NavigateCondition) &&
+                                string.IsNullOrEmpty(tbsfrom[b].On) &&
+                                string.IsNullOrEmpty(tbsfrom[b].Cascade) &&
+                                string.IsNullOrEmpty(tbsfrom[b].CascadeBefore)) sb.Append(" ON 1 = 1");
+                            else sb.Append(" ON ").Append(string.Join(" AND ", new[]
                                 {
-                                    if (string.IsNullOrEmpty(onSql)) sb.Append(tbsfrom[b].Cascade);
-                                    else sb.Append(" AND ").Append(tbsfrom[b].Cascade);
-                                }
-                            }
+                                    tbsfrom[b].CascadeBefore,
+                                    tbsfrom[b].NavigateCondition ?? tbsfrom[b].On,
+                                    tbsfrom[b].Cascade
+                                }.Where(sql => string.IsNullOrEmpty(sql) == false)));
                         }
                         break;
                     }
                     else
                     {
+                        if (a > 0 && !string.IsNullOrEmpty(tbsfrom[a].CascadeBefore)) sbnav.Append(" AND ").Append(tbsfrom[a].CascadeBefore);
                         if (!string.IsNullOrEmpty(tbsfrom[a].NavigateCondition)) sbnav.Append(" AND (").Append(tbsfrom[a].NavigateCondition).Append(")");
                         if (!string.IsNullOrEmpty(tbsfrom[a].On)) sbnav.Append(" AND (").Append(tbsfrom[a].On).Append(")");
                         if (a > 0 && !string.IsNullOrEmpty(tbsfrom[a].Cascade)) sbnav.Append(" AND ").Append(tbsfrom[a].Cascade);
                     }
                     if (a < tbsfrom.Length - 1) sb.Append(", ");
                 }
+                if (string.IsNullOrEmpty(_sample) == false)
+                    sb.Append(" \r\n").Append(_sample);
                 foreach (var tb in tbsjoin)
                 {
-                    if (tb.Type == SelectTableInfoType.Parent) continue;
                     switch (tb.Type)
                     {
+                        case SelectTableInfoType.Parent:
+                        case SelectTableInfoType.RawJoin:
+                        case SelectTableInfoType.WithoutJoin:
+                            continue;
                         case SelectTableInfoType.LeftJoin:
-                            sb.Append(" \r\nLEFT JOIN ");
+                            sb.Append(" \r\nGLOBAL LEFT JOIN ");
                             break;
                         case SelectTableInfoType.InnerJoin:
-                            sb.Append(" \r\nINNER JOIN ");
+                            sb.Append(" \r\nGLOBAL INNER JOIN ");
                             break;
                         case SelectTableInfoType.RightJoin:
-                            sb.Append(" \r\nRIGHT JOIN ");
+                            sb.Append(" \r\nGLOBAL RIGHT JOIN ");
                             break;
                     }
-                    sb.Append(_commonUtils.QuoteSqlName(tbUnion[tb.Table.Type])).Append(" ").Append(_aliasRule?.Invoke(tb.Table.Type, tb.Alias) ?? tb.Alias).Append(" ON ").Append(tb.On ?? tb.NavigateCondition);
-                    if (!string.IsNullOrEmpty(tb.Cascade)) sb.Append(" AND ").Append(tb.Cascade);
+                    sb.Append(_commonUtils.QuoteSqlName(tbUnion[tb.Table.Type])).Append(" ").Append(_aliasRule?.Invoke(tb.Table.Type, tb.Alias) ?? tb.Alias)
+                        .Append(" ON ").Append(string.Join(" AND ", new[]
+                        {
+                            tb.CascadeBefore,
+                            tb.On ?? tb.NavigateCondition,
+                            tb.Cascade
+                        }.Where(sql => string.IsNullOrEmpty(sql) == false)));
                     if (!string.IsNullOrEmpty(tb.On) && !string.IsNullOrEmpty(tb.NavigateCondition)) sbnav.Append(" AND (").Append(tb.NavigateCondition).Append(")");
                 }
                 if (_join.Length > 0) sb.Append(_join);
 
+                if (!string.IsNullOrEmpty(_tables[0].CascadeBefore)) sbnav.Append(" AND ").Append(_tables[0].CascadeBefore);
                 sbnav.Append(_where);
-                if (!string.IsNullOrEmpty(_tables[0].Cascade))
-                    sbnav.Append(" AND ").Append(_tables[0].Cascade);
+                if (!string.IsNullOrEmpty(_tables[0].Cascade)) sbnav.Append(" AND ").Append(_tables[0].Cascade);
 
                 if (sbnav.Length > 0)
                 {
@@ -103,8 +119,10 @@ namespace FreeSql.ClickHouse.Curd
                         sb.Append(" \r\nHAVING ").Append(_having.Substring(5));
                 }
                 sb.Append(_orderby);
+                if (string.IsNullOrEmpty(_limitBy) == false) 
+                    sb.Append(_limitBy);
                 if (_skip > 0 || _limit > 0)
-                    sb.Append(" \r\nlimit ").Append(Math.Max(0, _skip)).Append(",").Append(_limit > 0 ? _limit : -1);
+                    sb.Append(" \r\nLIMIT ").Append(Math.Max(0, _skip)).Append(",").Append(_limit > 0 ? _limit : -1);
 
                 sbnav.Clear();
                 if (tbUnionsGt0) sb.Append(") ftb");
@@ -129,7 +147,7 @@ namespace FreeSql.ClickHouse.Curd
         public override ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14> From<T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14>(Expression<Func<ISelectFromExpression<T1>, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, ISelectFromExpression<T1>>> exp) { this.InternalFrom(exp); var ret = new ClickHouseSelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14>(_orm, _commonUtils, _commonExpression, null); ClickHouseSelect<T1>.CopyData(this, ret, exp?.Parameters); return ret; }
         public override ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15> From<T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15>(Expression<Func<ISelectFromExpression<T1>, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, ISelectFromExpression<T1>>> exp) { this.InternalFrom(exp); var ret = new ClickHouseSelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15>(_orm, _commonUtils, _commonExpression, null); ClickHouseSelect<T1>.CopyData(this, ret, exp?.Parameters); return ret; }
         public override ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16> From<T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16>(Expression<Func<ISelectFromExpression<T1>, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, ISelectFromExpression<T1>>> exp) { this.InternalFrom(exp); var ret = new ClickHouseSelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16>(_orm, _commonUtils, _commonExpression, null); ClickHouseSelect<T1>.CopyData(this, ret, exp?.Parameters); return ret; }
-        public override string ToSql(string field = null) => ToSqlStatic(_commonUtils, _commonExpression, _select, _distinct, field ?? this.GetAllFieldExpressionTreeLevel2().Field, _join, _where, _groupby, _having, _orderby, _skip, _limit, _tables, this.GetTableRuleUnions(), _aliasRule, _tosqlAppendContent, _whereGlobalFilter, _orm);
+        public override string ToSql(string field = null) => ToSqlStatic(_commonUtils, _commonExpression, _select, _distinct, field ?? this.GetAllFieldExpressionTreeLevel2().Field, _join, _where, _groupby, _having, _orderby, _skip, _limit, _tables, this.GetTableRuleUnions(), _aliasRule, _tosqlAppendContent, _whereGlobalFilter, _orm, _limitBy, _sample);
     }
     class ClickHouseSelect<T1, T2> : FreeSql.Internal.CommonProvider.Select2Provider<T1, T2> where T2 : class
     {

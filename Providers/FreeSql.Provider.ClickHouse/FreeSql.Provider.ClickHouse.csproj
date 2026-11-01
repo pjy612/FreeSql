@@ -1,9 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
 	<PropertyGroup>
-		<!--;netcoreapp2.2;net472-->
-		<TargetFrameworks>netstandard2.1</TargetFrameworks>
-		<Version>3.2.500</Version>
+		<LangVersion>9</LangVersion>
+		<TargetFrameworks>net10.0;net9.0;net8.0;net7.0;net6.0;netstandard2.1</TargetFrameworks>
 		<GeneratePackageOnBuild>true</GeneratePackageOnBuild>
 		<Authors>FreeSql;ncc;YeXiangQin;ChenBo</Authors>
 		<Description>FreeSql 数据库实现，基于 ClickHouse.Client Ado.net</Description>
@@ -20,9 +19,12 @@
 		<SignAssembly>False</SignAssembly>
 		<AssemblyOriginatorKeyFile>key.snk</AssemblyOriginatorKeyFile>
 		<DelaySign>false</DelaySign>
+		<Version>3.5.311</Version>
+		<PackageReadmeFile>readme.md</PackageReadmeFile>
 	</PropertyGroup>
 
 	<ItemGroup>
+		<None Include="../../readme.md" Pack="true" PackagePath="\" />
 		<None Include="../../logo.png" Pack="true" PackagePath="\" />
 	</ItemGroup>
 
@@ -31,15 +33,12 @@
 	</ItemGroup>
 
 	<ItemGroup>
-		<PackageReference Include="ClickHouse.Client">
-		  <Version>4.0.1.462</Version>
-		</PackageReference>
+		<PackageReference Include="ClickHouse.Driver" Version="0.7.20" />
 	</ItemGroup>
 
-
-	<ItemGroup>
-		<ProjectReference Include="..\..\FreeSql\FreeSql.csproj" />
-	</ItemGroup>
+	<PropertyGroup Condition="'$(TargetFramework)' == 'net10.0' or '$(TargetFramework)' == 'net9.0' or '$(TargetFramework)' == 'net8.0' or '$(TargetFramework)' == 'net7.0' or '$(TargetFramework)' == 'net6.0'">
+		<DefineConstants>net60</DefineConstants>
+	</PropertyGroup>
 
 </Project>
 

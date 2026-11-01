@@ -52,7 +52,7 @@ namespace FreeSql.Firebird
             });
 
         public override string FormatSql(string sql, params object[] args) => sql?.FormatFirebird(args);
-        public override string QuoteSqlName(params string[] name)
+        public override string QuoteSqlNameAdapter(params string[] name)
         {
             if (name.Length == 1)
             {
@@ -78,6 +78,12 @@ namespace FreeSql.Firebird
         public override string StringConcat(string[] objs, Type[] types) => $"{string.Join(" || ", objs)}";
         public override string Mod(string left, string right, Type leftType, Type rightType) => $"mod({left},{right})";
         public override string Div(string left, string right, Type leftType, Type rightType) => $"trunc({left}/{right})";
+        public override string BitAnd(string left, string right) => $"BIN_AND({left},{right})";
+        public override string BitOr(string left, string right) => $"BIN_OR({left},{right})";
+        public override string BitShiftLeft(string left, string right) => $"BIN_SHL({left},{right})";
+        public override string BitShiftRight(string left, string right) => $"BIN_SHR({left},{right})";
+        public override string BitNot(string left) => $"BIN_NOT({left})";
+        public override string BitXor(string left, string right) => $"BIN_XOR({left},{right})";
         public override string Now => "current_timestamp";
         public override string NowUtc => "current_timestamp";
 
@@ -88,11 +94,29 @@ namespace FreeSql.Firebird
         {
             if (value == null) return "NULL";
             if (type.IsNumberType()) return string.Format(CultureInfo.InvariantCulture, "{0}", value);
-            if (type == typeof(byte[])) return $"x'{CommonUtils.BytesSqlRaw(value as byte[])}'";
-            if (type == typeof(TimeSpan) || type == typeof(TimeSpan?))
+            if (type == typeof(byte[]))
             {
-                var ts = (TimeSpan)value;
-                value = $"{Math.Floor(ts.TotalHours)}:{ts.Minutes}:{ts.Seconds}";
+                if (col.Attribute.StringLength < 0)
+                {
+                    var pam = AppendParamter(specialParams, $"p_{specialParams?.Count}{specialParamFlag}", null, type, value);
+                    return pam.ParameterName;
+                }
+                else
+                {
+                    return $"x'{CommonUtils.BytesSqlRaw(value as byte[])}'";
+                }
+            }
+            if (type == typeof(string))
+            {
+                if (col.Attribute.StringLength < 0)
+                {
+                    var pam = AppendParamter(specialParams, $"p_{specialParams?.Count}{specialParamFlag}", null, type, value);
+                    return pam.ParameterName;
+                }
+                else if (col != null && (specialParamFlag == "c" || specialParamFlag == "cu"))
+                {
+                    return $"cast('{value.ToString().Replace("'", "''")}' as {col.Attribute.DbType.Replace("NOT NULL", "").Replace("NULL", "")})"; //#1923
+                }
             }
             return FormatSql("{0}", value, 1);
         }

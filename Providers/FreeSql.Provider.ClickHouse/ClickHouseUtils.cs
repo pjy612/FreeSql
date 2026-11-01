@@ -1,13 +1,15 @@
 ﻿using FreeSql.Internal;
 using FreeSql.Internal.Model;
-using ClickHouse.Client.ADO;
+using ClickHouse.Driver.ADO;
 using System;
 using System.Collections.Generic;
 using System.Data.Common;
 using System.Globalization;
 using System.Data;
-using ClickHouse.Client.ADO.Parameters;
+using System.Text.Json;
+using ClickHouse.Driver.ADO.Parameters;
 using System.Text.RegularExpressions;
+using System.Text;
 
 namespace FreeSql.ClickHouse
 {
@@ -18,11 +20,27 @@ namespace FreeSql.ClickHouse
         }
 
         public override DbParameter AppendParamter(List<DbParameter> _params, string parameterName, ColumnInfo col, Type type, object value)
-        {
+         {
+            if (value is string str)
+                value = str?.Replace("\t", "\\t")
+                    .Replace("\r\n", "\\r\\n")
+                    .Replace("\n", "\\n")
+                    .Replace("\r", "\\r")
+                    .Replace("/", "\\/");
             if (string.IsNullOrEmpty(parameterName)) parameterName = $"p_{_params?.Count}";
             var dbtype = (DbType?)_orm.CodeFirst.GetDbInfo(type)?.type;
             DbParameter ret = new ClickHouseDbParameter { ParameterName = parameterName };//QuoteParamterName(parameterName)
             if (dbtype != null) ret.DbType = dbtype.Value;
+            if (value is Enum)
+            {
+                switch (ret.DbType)
+                {
+                    case DbType.Int32:
+                        value = Utils.GetDataReaderValue(typeof(int), value); break;
+                    case DbType.Int64:
+                        value = Utils.GetDataReaderValue(typeof(long), value); break;
+                }
+            }
             ret.Value = value;
             if (col != null)
             {
@@ -37,39 +55,57 @@ namespace FreeSql.ClickHouse
                         if (col.DbScale != 0) ret.Scale = col.DbScale;
                         break;
                 }
-                if (value is bool)
-                {
-                    ret.Value = (bool)value ? 1 : 0;
-                }
+                //if (value.GetType().IsArray)
+                //{
+                //     ret.DbType = DbType.Object;
+                //}
             }
             _params?.Add(ret);
             return ret;
         }
 
         public override DbParameter[] GetDbParamtersByObject(string sql, object obj) =>
-            Utils.GetDbParamtersByObject<DbParameter>(sql, obj, "?", (name, type, value) =>
+            Utils.GetDbParamtersByObject<DbParameter>(sql, obj, "@", (name, type, value) =>
             {
-                DbParameter ret = new ClickHouseDbParameter { ParameterName = $"?{name}", Value = value };
+                if (value is string str)
+                    value = str?.Replace("\t", "\\t")
+                        .Replace("\r\n", "\\r\\n")
+                        .Replace("\n", "\\n")
+                        .Replace("\r", "\\r")
+                        .Replace("/", "\\/");
+                DbParameter ret = new ClickHouseDbParameter { ParameterName = $"@{name}", Value = value };
                 var tp = _orm.CodeFirst.GetDbInfo(type)?.type;
-                if (tp != null)
-                    ret.DbType = (DbType)tp.Value;
+                if (tp != null) ret.DbType = (DbType)tp.Value;
+                if (value is Enum)
+                {
+                    if (tp != null)
+                        switch (ret.DbType)
+                        {
+                            case DbType.Int32:
+                                value = Utils.GetDataReaderValue(typeof(int), value); break;
+                            case DbType.Int64:
+                                value = Utils.GetDataReaderValue(typeof(long), value); break;
+                        }
+                    else
+                        value = Utils.GetDataReaderValue(typeof(int), value);
+                }
                 return ret;
             });
 
         public override string RewriteColumn(ColumnInfo col, string sql)
         {
+            if (string.IsNullOrWhiteSpace(col?.Attribute?.DbType)) return sql;
             col.Attribute.DbType = col.Attribute.DbType.Replace(" NOT NULL", "");
             if (string.IsNullOrWhiteSpace(col?.Attribute.RewriteSql) == false)
                 return string.Format(col.Attribute.RewriteSql, sql);
             if (Regex.IsMatch(sql, @"\{\{[\w\d]+_+\d:\{\d\}\}\}"))
                 return string.Format(sql, col.Attribute.DbType);
-            else
-                return sql;
+            return sql;
         }
 
         public override string FormatSql(string sql, params object[] args) => sql?.FormatClickHouse(args);
 
-        public override string QuoteSqlName(params string[] name)
+        public override string QuoteSqlNameAdapter(params string[] name)
         {
             if (name.Length == 1)
             {
@@ -135,16 +171,26 @@ namespace FreeSql.ClickHouse
         }
 
         public override string GetNoneParamaterSqlValue(List<DbParameter> specialParams, string specialParamFlag, ColumnInfo col, Type type, object value)
-        {
+         {
             if (value == null) return "NULL";
             if (type.IsNumberType()) return string.Format(CultureInfo.InvariantCulture, "{0}", value);
             if (type == typeof(byte[])) return $"0x{CommonUtils.BytesSqlRaw(value as byte[])}";
-            if (type == typeof(TimeSpan) || type == typeof(TimeSpan?))
-            {
-                var ts = (TimeSpan)value;
-                value = $"{Math.Floor(ts.TotalHours)}:{ts.Minutes}:{ts.Seconds}";
-            }
-            return FormatSql("{0}", value, 1);
+            if (value is Array)
+			{
+				var valueArr = value as Array;
+				var eleType = type.GetElementType();
+				var len = valueArr.GetLength(0);
+				var sb = new StringBuilder().Append("[");
+				for (var a = 0; a < len; a++)
+				{
+					var item = valueArr.GetValue(a);
+					if (a > 0) sb.Append(",");
+					sb.Append(GetNoneParamaterSqlValue(specialParams, specialParamFlag, col, eleType, item));
+				}
+				sb.Append("]");
+				return sb.ToString();
+			}
+			return FormatSql("{0}", value, 1);
         }
     }
 }

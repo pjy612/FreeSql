@@ -73,7 +73,7 @@ namespace FreeSql.MySql
             });
 
         public override string FormatSql(string sql, params object[] args) => sql?.FormatMySql(args);
-        public override string QuoteSqlName(params string[] name)
+        public override string QuoteSqlNameAdapter(params string[] name)
         {
             if (name.Length == 1)
             {
@@ -134,11 +134,6 @@ namespace FreeSql.MySql
             if (value == null) return "NULL";
             if (type.IsNumberType()) return string.Format(CultureInfo.InvariantCulture, "{0}", value);
             if (type == typeof(byte[])) return $"0x{CommonUtils.BytesSqlRaw(value as byte[])}";
-            if (type == typeof(TimeSpan) || type == typeof(TimeSpan?))
-            {
-                var ts = (TimeSpan)value;
-                value = $"{Math.Floor(ts.TotalHours)}:{ts.Minutes}:{ts.Seconds}";
-            }
             return FormatSql("{0}", value, 1);
         }
     }

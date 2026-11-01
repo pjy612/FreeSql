@@ -128,7 +128,7 @@ select
 trim(rdb$relation_name) as id,
 trim(rdb$owner_name) as owner,
 trim(rdb$relation_name) as name,
-trim(rdb$external_description) as comment,
+trim(rdb$description) as comment,
 rdb$relation_type as type
 from rdb$relations
 where rdb$system_flag=0" + (tbname == null ? "" : $" and {(ignoreCase ? "upper(trim(rdb$relation_name))" : "trim(rdb$relation_name)")} = {_commonUtils.FormatSql("{0}", tbname.Last())}");
@@ -312,14 +312,14 @@ where {0}", loc8);
                 if (!indexColumns.TryGetValue(table_id, out loc10))
                     indexColumns.Add(table_id, loc10 = new Dictionary<string, DbIndexInfo>());
                 if (!loc10.TryGetValue(index_id, out loc11))
-                    loc10.Add(index_id, loc11 = new DbIndexInfo());
+                    loc10.Add(index_id, loc11 = new DbIndexInfo { Name = index_id });
                 loc11.Columns.Add(new DbIndexColumnInfo { Column = loc9, IsDesc = is_desc });
                 if (is_unique && !is_primary_key)
                 {
                     if (!uniqueColumns.TryGetValue(table_id, out loc10))
                         uniqueColumns.Add(table_id, loc10 = new Dictionary<string, DbIndexInfo>());
                     if (!loc10.TryGetValue(index_id, out loc11))
-                        loc10.Add(index_id, loc11 = new DbIndexInfo());
+                        loc10.Add(index_id, loc11 = new DbIndexInfo { Name = index_id });
                     loc11.Columns.Add(new DbIndexColumnInfo { Column = loc9, IsDesc = is_desc });
                 }
             }

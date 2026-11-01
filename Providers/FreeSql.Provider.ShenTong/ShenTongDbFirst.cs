@@ -277,7 +277,6 @@ where {loc8.ToString().Replace("a.table_name", "ns.nspname || '.' || c.relname")
                 ds = _orm.Ado.ExecuteArray(CommandType.Text, sql);
                 if (ds == null) return loc1;
 
-                var position = 0;
                 foreach (object[] row in ds)
                 {
                     var object_id = string.Concat(row[0]);
@@ -327,7 +326,7 @@ where {loc8.ToString().Replace("a.table_name", "ns.nspname || '.' || c.relname")
                         Table = loc2[object_id],
                         Comment = comment,
                         DefaultValue = defaultValue,
-                        Position = ++position
+                        Position = attnum
                     });
                     loc3[object_id][column].DbType = this.GetDbType(loc3[object_id][column]);
                     loc3[object_id][column].CsType = this.GetCsTypeInfo(loc3[object_id][column]);
@@ -386,14 +385,14 @@ where {loc8.ToString().Replace("a.table_name", "ns.nspname || '.' || d.relname")
                     if (!indexColumns.TryGetValue(object_id, out loc10))
                         indexColumns.Add(object_id, loc10 = new Dictionary<string, DbIndexInfo>());
                     if (!loc10.TryGetValue(index_id, out loc11))
-                        loc10.Add(index_id, loc11 = new DbIndexInfo());
+                        loc10.Add(index_id, loc11 = new DbIndexInfo { Name = index_id });
                     loc11.Columns.Add(new DbIndexColumnInfo { Column = loc9, IsDesc = is_desc });
                     if (is_unique && !is_primary_key)
                     {
                         if (!uniqueColumns.TryGetValue(object_id, out loc10))
                             uniqueColumns.Add(object_id, loc10 = new Dictionary<string, DbIndexInfo>());
                         if (!loc10.TryGetValue(index_id, out loc11))
-                            loc10.Add(index_id, loc11 = new DbIndexInfo());
+                            loc10.Add(index_id, loc11 = new DbIndexInfo { Name = index_id });
                         loc11.Columns.Add(new DbIndexColumnInfo { Column = loc9, IsDesc = is_desc });
                     }
                 }
@@ -485,7 +484,7 @@ where {loc8.ToString().Replace("a.table_name", "a.pktable_schem || '.' || a.pkta
                             bool b2 = loc4.ForeignsDict.Values.Where(fk => fk.Columns.Where(c3 => c3.Name == c2.Name).Any()).Any();
                             compare = b2.CompareTo(b1);
                         }
-                        if (compare == 0) compare = c1.Name.CompareTo(c2.Name);
+                        if (compare == 0) compare = c1.Position.CompareTo(c2.Position);
                         return compare;
                     });
                     loc1.Add(loc4);

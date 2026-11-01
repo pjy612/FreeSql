@@ -1,6 +1,6 @@
-<h1 align="center"> 🦄 FreeSql </h1><div align="center">
+<h1 align="center"> 🦄 FreeSql, 第一款国产 AOT ORM！</h1><div align="center">
 
-FreeSql 是一款功能强大的对象关系映射（O/RM）组件，支持 .NET Core 2.1+、.NET Framework 4.0+ 以及 Xamarin。
+FreeSql 是一款功能强大的对象关系映射（O/RM）组件，支持 .NET Core 2.1+、.NET Framework 4.0+、Xamarin 以及 AOT。
 
 [![Member project of .NET Core Community](https://img.shields.io/badge/member%20project%20of-NCC-9e20c9.svg)](https://github.com/dotnetcore)
 [![nuget](https://img.shields.io/nuget/v/FreeSql.svg?style=flat-square)](https://www.nuget.org/packages/FreeSql) 
@@ -20,36 +20,23 @@ FreeSql 是一款功能强大的对象关系映射（O/RM）组件，支持 .NET
 - ✒ 支持 丰富的表达式函数，以及灵活的自定义解析；
 - 🏁 支持 导航属性一对多、多对多贪婪加载，以及延时加载；
 - 📃 支持 读写分离、分表分库、过滤器、乐观锁、悲观锁；
-- 🌳 支持 MySql/SqlServer/PostgreSQL/Oracle/Sqlite/Firebird/达梦/人大金仓/神舟通用/南大通用/翰高/ClickHouse/Access 等数据库；
+- 🌳 支持 MySql/SqlServer/PostgreSQL/Oracle/Sqlite/Firebird/达梦/人大金仓/南大通用/虚谷/神舟通用/翰高/ClickHouse/DuckDB/TDengine/QuestDB/Access 等数据库；
 
-QQ群：4336577(已满)、8578575(已满)、52508226(在线)
+QQ群：561616019(在线)、4336577(已满)、8578575(已满)、52508226(已满)
 
-## 📚 文档
+## 📚 文档开源（免费）
 
-| | |
-| - | - |
-| <img src="https://github.com/dotnetcore/FreeSql/raw/master/Examples/restful/001.png" width="30" height="46"/> | [《新人学习指引》](https://www.cnblogs.com/FreeSql/p/11531300.html) \| [《Select》](https://github.com/2881099/FreeSql/wiki/%e6%9f%a5%e8%af%a2) \| [《Update》](https://github.com/2881099/FreeSql/wiki/%e4%bf%ae%e6%94%b9) \| [《Insert》](https://github.com/2881099/FreeSql/wiki/%e6%b7%bb%e5%8a%a0) \| [《Delete》](https://github.com/2881099/FreeSql/wiki/%e5%88%a0%e9%99%a4) |
-| <img src="https://github.com/dotnetcore/FreeSql/raw/master/Examples/restful/002.png" width="30" height="46"/> | [《表达式函数》](https://github.com/2881099/FreeSql/wiki/%e8%a1%a8%e8%be%be%e5%bc%8f%e5%87%bd%e6%95%b0) \| [《CodeFirst》](https://github.com/2881099/FreeSql/wiki/CodeFirst) \| [《DbFirst》](https://github.com/2881099/FreeSql/wiki/DbFirst) \| [《过滤器》](https://github.com/2881099/FreeSql/wiki/%e8%bf%87%e6%bb%a4%e5%99%a8) |
-| <img src="https://github.com/dotnetcore/FreeSql/raw/master/Examples/restful/003.png" width="30" height="46"/> | [《Repository》](https://github.com/2881099/FreeSql/wiki/Repository) \| [《UnitOfWork》](https://github.com/2881099/FreeSql/wiki/%e5%b7%a5%e4%bd%9c%e5%8d%95%e5%85%83) \| [《DbContext》](https://github.com/2881099/FreeSql/wiki/DbContext) \| [《ADO》](https://github.com/2881099/FreeSql/wiki/ADO) \| [《AOP》](https://github.com/2881099/FreeSql/wiki/AOP) |
-| <img src="https://github.com/dotnetcore/FreeSql/raw/master/Examples/restful/004.png" width="30" height="46"/> | [《读写分离》](https://github.com/2881099/FreeSql/wiki/%e8%af%bb%e5%86%99%e5%88%86%e7%a6%bb) \| [《分表分库》](https://github.com/2881099/FreeSql/wiki/%e5%88%86%e8%a1%a8%e5%88%86%e5%ba%93) \| [《黑科技》](https://github.com/2881099/FreeSql/wiki/%E9%AA%9A%E6%93%8D%E4%BD%9C) \| [《常见问题》](https://github.com/dotnetcore/FreeSql/wiki/%E5%B8%B8%E8%A7%81%E9%97%AE%E9%A2%98)  \| [*更新日志*](https://github.com/2881099/FreeSql/wiki/%e6%9b%b4%e6%96%b0%e6%97%a5%e5%bf%97) |
-
-> FreeSql 提供多种使用习惯，请根据实际情况选择团队合适的一种：
-
-- 要么 FreeSql，原始用法；
-- 要么 [FreeSql.Repository](https://github.com/2881099/FreeSql/wiki/Repository)，仓储+工作单元习惯；
-- 要么 [FreeSql.DbContext](https://github.com/2881099/FreeSql/wiki/DbContext)，有点像 EFCore 的使用习惯；
-- 要么 [FreeSql.BaseEntity](https://github.com/2881099/FreeSql/tree/master/Examples/base_entity)，求简单使用这个；
+[部署本地文档](https://github.com/2881099/FreeSql.Wiki.VuePress)、[在线文档](https://freesql.net)
 
 > 示范项目
 
 - [zhontai.net Admin 后台管理系统](https://github.com/zhontai/Admin.Core)
 - [A simple and practical CMS implemented by .NET Core](https://github.com/luoyunchong/lin-cms-dotnetcore)
-- [iusaas.com SaaS 企业应用管理系统](https://github.com/alonsoalon/TenantSite.Server)
-- [EasyCms 企业建站，事业单位使用的CMS管理系统](https://github.com/jasonyush/EasyCMS)
-- [内容管理系统](https://github.com/hejiyong/fscms)
+- [AIBPM 一个开源的工作流引擎](https://github.com/leooneone/aibpm.plus)
+- [NetAdmin C#12/.NET9、FreeSql 快速开发框架](https://github.com/nsnail/NetAdmin)
 
 <p align="center">
-  <img src="https://github.com/dotnetcore/FreeSql/raw/master/functions12.png"/>
+  <img src="https://github.com/dotnetcore/FreeSql/raw/master/functions13.png"/>
 </p>
 
 ## 🚀 快速入门
@@ -102,7 +89,7 @@ fsql.Select<Tag>().IncludeMany(a => a.Tags, then => then.Where(sub => sub.Name =
 //ManyToMany
 fsql.Select<Song>()
   .IncludeMany(a => a.Tags, then => then.Where(sub => sub.Name == "foo"))
-  .Where(s => s.Tags.AsSelect().Any(t => t.Name == "国语"))
+  .Where(s => s.Tags.Any(t => t.Name == "国语"))
   .ToList();
 
 //Other
@@ -110,7 +97,7 @@ fsql.Select<YourType>()
   .Where(a => a.IsDelete == 0)
   .WhereIf(keyword != null, a => a.UserName.Contains(keyword))
   .WhereIf(role_id > 0, a => a.RoleId == role_id)
-  .Where(a => a.Nodes.AsSelect().Any(t => t.Parent.Id == t.UserId))
+  .Where(a => a.Nodes.Any(t => t.Parent.Id == t.UserId))
   .Count(out var total)
   .Page(page, size)
   .OrderByDescending(a => a.Id)
@@ -124,6 +111,13 @@ fsql.Select<Song>().Where(a => new[] { 1, 2, 3 }.Contains(a.Id)).ToList();
 fsql.Select<Song>().Where(a => a.CreateTime.Date == DateTime.Today).ToList();
 
 fsql.Select<Song>().OrderBy(a => Guid.NewGuid()).Limit(10).ToList();
+
+fsql.Select<Song>().ToList(a => new
+{
+    a.Id,
+    Tags = fsql.Select<Tag>().ToList(),
+    SongTags = fsql.Select<SongTag>().Where(b => b.TopicId == a.Id).ToList()
+});
 ```
 [更多信息](https://github.com/2881099/FreeSql/wiki/%e8%a1%a8%e8%be%be%e5%bc%8f%e5%87%bd%e6%95%b0) 
 
@@ -135,7 +129,7 @@ fsql.Select<Song>().OrderBy(a => Guid.NewGuid()).Limit(10).ToList();
 [Transactional]
 public void Add() {
   var repo = ioc.GetService<BaseRepository<Tag>>();
-  repo.DbContextOptions.EnableAddOrUpdateNavigateList = true;
+  repo.DbContextOptions.EnableCascadeSave = true;
 
   var item = new Tag {
     Name = "testaddsublist",
@@ -203,14 +197,18 @@ Elapsed: 00:00:00.6495301; Query Entity Counts: 131072; ORM: Dapper
 [feijie999](https://github.com/feijie999), 
 constantine, 
 [JohnZhou2020](https://github.com/JohnZhou2020), 
-[mafeng8](https://github.com/mafeng8) 等。
-
+[mafeng8](https://github.com/mafeng8), 
+[VicBilibily](https://github.com/VicBilibily), 
+[Soar](https://github.com/sgf),
+[quzhen91](https://github.com/quzhen91),
+homejun,
+[d4ilys](https://github.com/d4ilys) 等。
 
 ## 💕 Donation (捐赠)
 
-L*y 58元、花花 88元、麦兜很乖 50元、网络来者 2000元、John 99.99元、alex 666元、bacongao 36元、无名 100元、Eternity 188元、无名 10元、⌒.Helper~..oO 66元、习惯与被习惯 100元、无名 100元、蔡易喋 88.88元、中讯科技 1000元、Good Good Work 24元、炽焰 6.6元、Nothing 100元、兰州天擎赵 500元、哈利路亚 300元、
+L\*y 58元、花花 88元、麦兜很乖 50元、网络来者 2000元、John 99.99元、alex 666元、bacongao 36元、无名 100元、Eternity 188元、无名 10元、⌒.Helper~..oO 66元、习惯与被习惯 100元、无名 100元、蔡易喋 88.88元、中讯科技 1000元、Good Good Work 24元、Nothing 100元、兰州天擎赵 500元、哈利路亚 300元、
 无名 100元、蛰伏 99.99元、TCYM 66.66元、MOTA 5元、LDZXG 30元、Near 30元、建爽 66元、无名 200元、LambertWu 100元、无名 18.88元、乌龙 50元、无名 100元、陳怼怼 66.66元、陳怼怼 66.66元、丁淮 100元、李伟坚-Excel催化剂 100元、白狐 6.66元、她微笑的脸y 30元、Eternity²º²¹ 588元、夜归柴门 88元、蔡易喋 666.66元、
-*礼 10元、litrpa 88元、Alax CHOW 200元、Daily 66元、k*t 66元、蓝 100元、*菜 10元、生命如歌 1000元
+*礼 10元、litrpa 88元、Alax CHOW 200元、Daily 66元、k*t 66元、蓝 100元、\*菜 10元、生命如歌 1000元、山鸡 88元、平凡 100元、大树 1000元、软软的毛毛虫 66.66元、问卷星 2000元、与你无关 5000元
 
 > 超级感谢你的打赏。
 

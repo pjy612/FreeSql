@@ -132,7 +132,6 @@ public class RazorModel
 					case DataType.PostgreSQL:
 					case DataType.OdbcPostgreSQL:
 					case DataType.KingbaseES:
-					case DataType.OdbcKingbaseES:
 					case DataType.ShenTong:
 						switch (col.DbTypeTextFull.ToLower())
 						{
@@ -157,7 +156,6 @@ public class RazorModel
 						}
 						break;
 					case DataType.Dameng:
-					case DataType.OdbcDameng:
 						switch (col.DbTypeTextFull.ToLower())
 						{
 							case "text": sb.Add("StringLength = -2"); break;
@@ -231,7 +229,7 @@ public class RazorModel
 		var defval = col.DefaultValue?.Trim();
 		if (string.IsNullOrEmpty(defval)) return null;
 		var cstype = col.CsType.NullableTypeOrThis();
-		if (fsql.Ado.DataType == DataType.SqlServer || fsql.Ado.DataType == DataType.OdbcSqlServer)
+		if (fsql.Ado.DataType == DataType.SqlServer || fsql.Ado.DataType == DataType.OdbcSqlServer || fsql.Ado.DataType == DataType.CustomSqlServer)
 		{
 			if (defval.StartsWith("((") && defval.EndsWith("))")) defval = defval.Substring(2, defval.Length - 4);
 			else if (defval.StartsWith("('") && defval.EndsWith("')")) defval = defval.Substring(2, defval.Length - 4).Replace("''", "'");
@@ -242,19 +240,28 @@ public class RazorModel
 			if (cstype == typeof(string) && string.Compare(defval, "newid()", true) == 0) return $"Guid.NewGuid().ToString().ToUpper()";
 			if (defval == "NULL") return null;
 		}
+		if ((fsql.Ado.DataType == DataType.PostgreSQL || fsql.Ado.DataType == DataType.OdbcPostgreSQL || fsql.Ado.DataType == DataType.CustomPostgreSQL ||
+					fsql.Ado.DataType == DataType.KingbaseES ||
+					fsql.Ado.DataType == DataType.ShenTong))
+		{
+			switch (defval)
+			{
+				case "uuid_generate_v4()": return isInsertValueSql ? defval : null;
+			}
+		}
 		if ((cstype == typeof(string) && defval.StartsWith("'") && defval.EndsWith("'::character varying") ||
-			cstype == typeof(Guid) && defval.StartsWith("'") && defval.EndsWith("'::uuid")
-			) && (fsql.Ado.DataType == DataType.PostgreSQL || fsql.Ado.DataType == DataType.OdbcPostgreSQL ||
-				fsql.Ado.DataType == DataType.KingbaseES || fsql.Ado.DataType == DataType.OdbcKingbaseES ||
-				fsql.Ado.DataType == DataType.ShenTong))
-		{
-			defval = defval.Substring(1, defval.LastIndexOf("'::") - 1).Replace("''", "'");
-		}
-		else if (defval.StartsWith("'") && defval.EndsWith("'"))
-		{
-			defval = defval.Substring(1, defval.Length - 2).Replace("''", "'");
-			if (fsql.Ado.DataType == DataType.MySql || fsql.Ado.DataType == DataType.OdbcMySql) defval = defval.Replace("\\\\", "\\");
-		}
+				cstype == typeof(Guid) && defval.StartsWith("'") && defval.EndsWith("'::uuid")
+				) && (fsql.Ado.DataType == DataType.PostgreSQL || fsql.Ado.DataType == DataType.OdbcPostgreSQL || fsql.Ado.DataType == DataType.CustomPostgreSQL ||
+					fsql.Ado.DataType == DataType.KingbaseES ||
+					fsql.Ado.DataType == DataType.ShenTong))
+			{
+				defval = defval.Substring(1, defval.LastIndexOf("'::") - 1).Replace("''", "'");
+			}
+			else if (defval.StartsWith("'") && defval.EndsWith("'"))
+			{
+				defval = defval.Substring(1, defval.Length - 2).Replace("''", "'");
+				if (fsql.Ado.DataType == DataType.MySql || fsql.Ado.DataType == DataType.OdbcMySql) defval = defval.Replace("\\\\", "\\");
+			}
 		if (cstype.IsNumberType() && decimal.TryParse(defval, out var trydec))
 		{
 			if (isInsertValueSql) return defval;

@@ -16,6 +16,18 @@ namespace FreeSql.Tests
 {
     public class UnitTest5
     {
+
+        [Fact]
+        public void TestConstDtoStringEmpty()
+        {
+            var fsql = g.mysql;
+            var sql = fsql.Select<TestDto>().ToSql(a => new
+            {
+                empty = ""
+            });
+            Assert.Equal(@"SELECT '' as1 
+FROM `TestDto` a", sql);
+        }
         // DTO
         public class TestDto
         {
@@ -153,7 +165,7 @@ WHERE (a.""dw_id"" = @exp_0 AND ((a.""wyqy_id"") in (SELECT b.""wyqy_id""
                 .Set(a => a.NotTaxCostPrice, report.NotTaxCostPrice)
                 .Where(x => x.ProductId == report.ProductId && x.MerchantId == report.MerchantId)
                 .ToSql();
-            Assert.Equal(@"UPDATE `ProductStockBak` SET `NotTaxTotalCostPrice` = 47.844297 * `CurrentQty`, `NotTaxCostPrice` = 47.844297 
+            Assert.Equal(@"UPDATE `ProductStockBak` SET `NotTaxTotalCostPrice` = (47.844297 * `CurrentQty`), `NotTaxCostPrice` = 47.844297 
 WHERE (`ProductId` = '00000000-0000-0000-0000-000000000000' AND `MerchantId` = '00000000-0000-0000-0000-000000000000')", sql);
 
 
@@ -231,7 +243,7 @@ WHERE (`ProductId` = '00000000-0000-0000-0000-000000000000' AND `MerchantId` = '
 FROM ""ts_up_dywhere01"" a", sql);
 
             sql = fsql.Select<ts_up_dywhere01>().Select(a => new { a.status }).Distinct().ToSql();
-            fsql.Select<ts_up_dywhere01>().Select(a => new { a.status }).Distinct().Count(out count);
+            fsql.Select<ts_up_dywhere01>().Select(a => new { a.status }).Distinct().Count(out var count2);
 
             Assert.Equal(@"SELECT DISTINCT a.""status"" as1 
 FROM ""ts_up_dywhere01"" a", sql);

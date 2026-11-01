@@ -1,4 +1,4 @@
-using FreeSql.DataAnnotations;
+﻿using FreeSql.DataAnnotations;
 using FreeSql.Internal.Model;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
@@ -43,6 +43,47 @@ namespace FreeSql.Tests.Sqlite
             public string Name { get; set; }
 
             public List<TestTypeInfo> Types { get; set; }
+        }
+
+        [Table(Name = "reread_sql_gxb")]
+        class RereadSqlGxb
+        {
+            [Column(IsPrimary = true)]
+            public int Id { get; set; }
+            public string ObjectId { get; set; }
+        }
+
+        [Table(Name = "reread_sql_gxb_ysk")]
+        class RereadSqlGxbYsk : RereadSqlGxb { }
+
+        [Table(Name = "reread_sql_geo")]
+        class RereadSqlGeo
+        {
+            [Column(IsPrimary = true)]
+            public int Id { get; set; }
+            public string ObjectId { get; set; }
+            [Column(RereadSql = "substring({0},1,2)")]
+            public string Geometry { get; set; }
+        }
+
+        [Table(Name = "reread_sql_geo_ysk")]
+        class RereadSqlGeoYsk : RereadSqlGeo { }
+
+        [Fact]
+        public void FromQuery_AsType_RereadSql_PreservesColumnAlias()
+        {
+            g.sqlite.CodeFirst.SyncStructure<RereadSqlGxbYsk>();
+            g.sqlite.CodeFirst.SyncStructure<RereadSqlGeoYsk>();
+
+            var selectGxb = g.sqlite.Select<RereadSqlGxb>().AsType(typeof(RereadSqlGxbYsk));
+            var selectGeo = g.sqlite.Select<RereadSqlGeo>().AsType(typeof(RereadSqlGeoYsk));
+            var select = selectGxb.FromQuery(selectGeo)
+                .LeftJoin((gxb, geo) => gxb.ObjectId == geo.ObjectId);
+
+            var sql = select.ToSql((gxb, geo) => new { gxb, geo });
+
+            Assert.Contains("substring(a.\"Geometry\",1,2) \"Geometry\"", sql);
+            select.ToList((gxb, geo) => new { gxb, geo });
         }
 
         public partial class Song
@@ -234,7 +275,7 @@ namespace FreeSql.Tests.Sqlite
 
             g.sqlite.Delete<District>().Where("1=1").ExecuteAffrows();
             var repo = g.sqlite.GetRepository<District>();
-            repo.DbContextOptions.EnableAddOrUpdateNavigateList = true;
+            repo.DbContextOptions.EnableCascadeSave = true;
             repo.Insert(new District
             {
                 Code = "001",
@@ -871,8 +912,8 @@ limit 0,10", t1);
                 all = a,
                 count = (long)select.As("b").Sum(b => b.Id)
             });
-            Assert.Equal(@"SELECT a.""Id"" as1, a.""Clicks"" as2, a.""TypeGuid"" as3, a.""Title"" as4, a.""CreateTime"" as5, (SELECT sum(b.""Id"") 
-    FROM ""tb_topic22"" b) as6 
+            Assert.Equal(@"SELECT a.""Id"" as1, a.""Clicks"" as2, a.""TypeGuid"" as3, a.""Title"" as4, a.""CreateTime"" as5, ifnull((SELECT sum(b.""Id"") 
+    FROM ""tb_topic22"" b), 0) as6 
 FROM ""tb_topic22"" a", subquery);
             var subqueryList = select.ToList(a => new
             {
@@ -888,8 +929,8 @@ FROM ""tb_topic22"" a", subquery);
                 all = a,
                 count = select.As("b").Min(b => b.Id)
             });
-            Assert.Equal(@"SELECT a.""Id"" as1, a.""Clicks"" as2, a.""TypeGuid"" as3, a.""Title"" as4, a.""CreateTime"" as5, (SELECT min(b.""Id"") 
-    FROM ""tb_topic22"" b) as6 
+            Assert.Equal(@"SELECT a.""Id"" as1, a.""Clicks"" as2, a.""TypeGuid"" as3, a.""Title"" as4, a.""CreateTime"" as5, ifnull((SELECT min(b.""Id"") 
+    FROM ""tb_topic22"" b), 0) as6 
 FROM ""tb_topic22"" a", subquery);
             var subqueryList = select.ToList(a => new
             {
@@ -905,8 +946,8 @@ FROM ""tb_topic22"" a", subquery);
                 all = a,
                 count = select.As("b").Max(b => b.Id)
             });
-            Assert.Equal(@"SELECT a.""Id"" as1, a.""Clicks"" as2, a.""TypeGuid"" as3, a.""Title"" as4, a.""CreateTime"" as5, (SELECT max(b.""Id"") 
-    FROM ""tb_topic22"" b) as6 
+            Assert.Equal(@"SELECT a.""Id"" as1, a.""Clicks"" as2, a.""TypeGuid"" as3, a.""Title"" as4, a.""CreateTime"" as5, ifnull((SELECT max(b.""Id"") 
+    FROM ""tb_topic22"" b), 0) as6 
 FROM ""tb_topic22"" a", subquery);
             var subqueryList = select.ToList(a => new
             {
@@ -922,8 +963,8 @@ FROM ""tb_topic22"" a", subquery);
                 all = a,
                 count = select.As("b").Avg(b => b.Id)
             });
-            Assert.Equal(@"SELECT a.""Id"" as1, a.""Clicks"" as2, a.""TypeGuid"" as3, a.""Title"" as4, a.""CreateTime"" as5, (SELECT avg(b.""Id"") 
-    FROM ""tb_topic22"" b) as6 
+            Assert.Equal(@"SELECT a.""Id"" as1, a.""Clicks"" as2, a.""TypeGuid"" as3, a.""Title"" as4, a.""CreateTime"" as5, ifnull((SELECT avg(b.""Id"") 
+    FROM ""tb_topic22"" b), 0) as6 
 FROM ""tb_topic22"" a", subquery);
             var subqueryList = select.ToList(a => new
             {
@@ -961,8 +1002,10 @@ WHERE (((cast(a.""Id"" as character)) in (SELECT b.""Title""
             var listt = select.AsTable((a, b) => "(select * from tb_topic where clicks > 10)").Page(1, 10).ToList();
 
             var tenantId = 1;
-            var reposTopic = g.sqlite.GetGuidRepository<Topic>(null, oldname => $"{oldname}_{tenantId}");
-            var reposType = g.sqlite.GetGuidRepository<TestTypeInfo>(null, oldname => $"{oldname}_{tenantId}");
+            var reposTopic = g.sqlite.GetRepository<Topic, Guid>();
+            var reposType = g.sqlite.GetRepository<TestTypeInfo, Guid>();
+            reposTopic.AsTable(oldname => $"{oldname}_{tenantId}");
+            reposType.AsTable(oldname => $"{oldname}_{tenantId}");
 
             //reposTopic.Delete(Guid.Empty);
             //reposTopic.Find(Guid.Empty);
@@ -2072,7 +2115,7 @@ WHERE (((cast(a.""Id"" as character)) in (SELECT b.""Title""
             var fsql = g.sqlite;
             fsql.Delete<BaseDistrict>().Where("1=1").ExecuteAffrows();
             var repo = fsql.GetRepository<VM_District_Child>();
-            repo.DbContextOptions.EnableAddOrUpdateNavigateList = true;
+            repo.DbContextOptions.EnableCascadeSave = true;
             repo.DbContextOptions.NoneParameter = true;
             repo.Insert(new VM_District_Child
             {
@@ -2541,12 +2584,54 @@ WHERE (((name,no) in (('testname01','testname01')) OR not((a.""no"") LIKE '%test
             public ts_dyfilter_enum01_status status { get; set; }
         }
         public enum ts_dyfilter_enum01_status { staring, stoped, finished }
+
+
+        [Fact]
+        public void WhereDynamicFilter2()
+        {
+            var fsql = g.sqlite;
+
+            var dyfilterJson = @"
+{
+  ""Logic"" : ""Or"",
+  ""Filters"" :
+  [
+    {
+      ""Field"" : ""RegCount FreeSql.Tests.Sqlite.DynamicFilterMyCustom, FreeSql.Tests.Provider.Sqlite.Data"",
+      ""Operator"" : ""Custom"",
+      ""Value"" : ""19""
+    },
+    {
+      ""Field"" : ""name"",
+      ""Operator"" : ""NotEndsWith"",
+      ""Value"" : ""testname01""
+    }
+  ]
+}";
+            var dyfilter = JsonConvert.DeserializeObject<DynamicFilterInfo>(dyfilterJson);
+            var sql = fsql.Select<ts_dyfilter_enum01>().WhereDynamicFilter(dyfilter).ToSql();
+
+        }
     }
 
+    class RegLog
+    {
+        public Guid tid { get; set; }
+    }
     public class DynamicFilterMyCustom
     {
         [DynamicFilterCustom]
-        public static string MyRawSql(string value) => value;
+        public static string RegCount(object sender, string value)
+        {
+            var count = int.Parse(value);
+
+            var select = sender as Select0Provider;
+            var sql = select._orm.Select<RegLog>().ToSql("count(1)");
+            return $"({sql}) > {count}";
+        }
+
+        [DynamicFilterCustom]
+        public static string MyRawSql(object sender, string value) => value;
 
         public static string TupleIn(string value)
         {

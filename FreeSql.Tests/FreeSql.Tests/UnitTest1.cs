@@ -1,22 +1,16 @@
 ﻿using FreeSql.DataAnnotations;
-using FreeSql;
+using Newtonsoft.Json;
 using System;
-using System.Collections.Generic;
-using Xunit;
-using System.Linq;
-using Newtonsoft.Json.Linq;
-using NpgsqlTypes;
-using Npgsql.LegacyPostgis;
-using System.Linq.Expressions;
-using System.Threading.Tasks;
 using System.Collections;
+using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
+using System.Linq.Expressions;
+using System.Threading;
+using System.Threading.Tasks;
+using Xunit;
 using Zeus;
 using Zeus.Domain.Enum;
-using System.ComponentModel.DataAnnotations;
-using System.Reflection;
-using System.Threading;
-using Newtonsoft.Json;
 
 namespace FreeSql.Tests
 {
@@ -88,7 +82,7 @@ namespace FreeSql.Tests
             public string Title { get; set; }
             public override Task Persistent(IRepositoryUnitOfWork uof)
             {
-                uof.GetGuidRepository<TestEntity>().Insert(this);
+                uof.GetRepository<TestEntity, Guid>().Insert(this);
                 return Task.CompletedTask;
             }
             public override Task Persistent()
@@ -600,19 +594,19 @@ namespace FreeSql.Tests
 
 
             IFreeSql fsql = new FreeSql.FreeSqlBuilder()
-              .UseConnectionString(FreeSql.DataType.PostgreSQL, "Host=192.168.164.10;Port=5432;Username=postgres;Password=123456;Database=tedb;Pooling=true;Maximum Pool Size=7")
+              .UseConnectionString(FreeSql.DataType.PostgreSQL, "Host=127.0.0.1;Port=5432;Username=postgres;Password=123456;Database=tedb;Pooling=true;Maximum Pool Size=7")
               .UseNameConvert(FreeSql.Internal.NameConvertType.PascalCaseToUnderscoreWithLower)
               .UseNoneCommandParameter(true)
               .UseAutoSyncStructure(true) //自动同步实体结构到数据库
               .UseMonitorCommand(a => Trace.WriteLine(a.CommandText))
               .Build();
 
-            var data = fsql.Select<Post>().ToList(r => new
-            {
-                Id = r.Id,
-                Name = r.AuthorId.ToString(),
-                AuthorName = r.Author.Name,
-            });
+            //var data = fsql.Select<Post>().ToList(r => new
+            //{
+            //    Id = r.Id,
+            //    Name = r.AuthorId.ToString(),
+            //    AuthorName = r.Author.Name,
+            //});
 
             //g.mysql.Aop.AuditValue += (s, e) =>
             //{
@@ -740,7 +734,8 @@ namespace FreeSql.Tests
                  .ToList(a => new
                  {
                      a.Key,
-                     sss = a.Sum(a.Value.Item1.OptionsEntity04)
+                     sss = a.Sum(a.Value.Item1.OptionsEntity04),
+                     xxx = SqlExt.DistinctCount(a.Value.Item2.Title)
                  });
 
 
@@ -830,8 +825,8 @@ namespace FreeSql.Tests
             ).ToSql();
 
 
-            g.sqlite.SetDbContextOptions(opt => opt.EnableAddOrUpdateNavigateList = true);
-            var trepo = g.sqlite.GetGuidRepository<TaskBuild>();
+            g.sqlite.SetDbContextOptions(opt => opt.EnableCascadeSave = true);
+            var trepo = g.sqlite.GetRepository<TaskBuild, Guid>();
             trepo.Insert(new TaskBuild
             {
                 TaskName = "tt11",
@@ -1146,7 +1141,7 @@ namespace FreeSql.Tests
             };
 
             var repo = g.mysql.GetRepository<Order>();
-            repo.DbContextOptions.EnableAddOrUpdateNavigateList = true;
+            repo.DbContextOptions.EnableCascadeSave = true;
             repo.Insert(neworder);
 
             var order = g.mysql.Select<Order>().Where(a => a.Id == neworder.Id).ToOne(); //查询订单表

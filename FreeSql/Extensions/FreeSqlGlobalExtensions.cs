@@ -1,5 +1,6 @@
 ﻿using FreeSql;
 using FreeSql.DataAnnotations;
+using FreeSql.Internal;
 using FreeSql.Internal.CommonProvider;
 using FreeSql.Internal.Model;
 using FreeSql.Internal.ObjectPool;
@@ -20,6 +21,16 @@ using System.Threading.Tasks;
 
 public static partial class FreeSqlGlobalExtensions
 {
+#if net40
+#else
+    internal static object GetTaskReflectionResult(this Task task)
+    {
+        var propResult = task?.GetType().GetProperty("Result");
+        if (propResult != null) return propResult.GetValue(task, new object[0]);
+        return null;
+    }
+#endif
+
     #region Type 对象扩展方法
     static Lazy<Dictionary<Type, bool>> _dicIsNumberType = new Lazy<Dictionary<Type, bool>>(() => new Dictionary<Type, bool>
     {
@@ -48,7 +59,7 @@ public static partial class FreeSqlGlobalExtensions
     });
     public static bool IsIntegerType(this Type that) => that == null ? false : (_dicIsNumberType.Value.TryGetValue(that, out var tryval) ? tryval : false);
     public static bool IsNumberType(this Type that) => that == null ? false : _dicIsNumberType.Value.ContainsKey(that);
-    public static bool IsNullableType(this Type that) => that.IsArray == false && that?.FullName.StartsWith("System.Nullable`1[") == true;
+    public static bool IsNullableType(this Type that) => that == null ? false : (that.IsArray == false && that.FullName.StartsWith("System.Nullable`1[") == true);
     public static bool IsAnonymousType(this Type that) => that == null ? false : (that.FullName.StartsWith("<>f__AnonymousType") || that.FullName.StartsWith("VB$AnonymousType"));
     public static bool IsArrayOrList(this Type that) => that == null ? false : (that.IsArray || typeof(IList).IsAssignableFrom(that));
     public static Type NullableTypeOrThis(this Type that) => that?.IsNullableType() == true ? that.GetGenericArguments().First() : that;
@@ -127,23 +138,43 @@ public static partial class FreeSqlGlobalExtensions
                 .Append(string.Join(", ", genericParameters.Select(a => a.DisplayCsharp())))
                 .Append('>');
 
-        sb.Append('(').Append(string.Join(", ", method.GetParameters().Select(a => $"{a.ParameterType.DisplayCsharp()} {a.Name}"))).Append(')');
+        sb.Append("(").Append(string.Join(", ", method.GetParameters().Select(a => LocalDisplayCsharpParameter(a)))).Append(")");
         return sb.ToString();
+
+        string LocalDisplayCsharpParameter(ParameterInfo lp)
+        {
+            var pstr = "";
+            object[] pattrs = new object[0];
+            try { pattrs = lp.GetCustomAttributes(false); } catch { }
+            if (pattrs.Any(a => a is ParamArrayAttribute)) pstr = "params ";
+            pstr = $"{pstr}{lp.ParameterType.DisplayCsharp()} {lp.Name}";
+#if net40
+            if (pattrs.Any(a => a is System.Runtime.InteropServices.OptionalAttribute) == false) return pstr;
+#else
+            if (lp.HasDefaultValue == false) return pstr;
+#endif
+            if (lp.DefaultValue == null) return $"{pstr} = null";
+            if (lp.ParameterType == typeof(string)) return $"{pstr} = \"{lp.DefaultValue.ToString().Replace("\"", "\\\"").Replace("\r\n", "\\r\\n").Replace("\n", "\\n")}\"";
+            if (lp.ParameterType == typeof(bool) || lp.ParameterType == typeof(bool?)) return $"{pstr} = {lp.DefaultValue.ToString().Replace("False", "false").Replace("True", "true")}";
+            if (lp.ParameterType.IsEnum) return $"{pstr} = {lp.ParameterType.DisplayCsharp(false)}.{lp.DefaultValue}";
+            return $"{pstr} = {lp.DefaultValue}";
+        }
     }
     public static object CreateInstanceGetDefaultValue(this Type that)
     {
         if (that == null) return null;
+        if (that == typeof(void)) return null;
         if (that == typeof(string)) return default(string);
         if (that == typeof(Guid)) return default(Guid);
         if (that == typeof(byte[])) return default(byte[]);
         if (that.IsArray) return Array.CreateInstance(that.GetElementType(), 0);
         if (that.IsInterface || that.IsAbstract) return null;
-        var ctorParms = that.InternalGetTypeConstructor0OrFirst(false)?.GetParameters();
+        var ctor = that.InternalGetTypeConstructor0OrFirst(false);
+        var ctorParms = ctor?.GetParameters();
         if (ctorParms == null || ctorParms.Any() == false) return Activator.CreateInstance(that, true);
-        return Activator.CreateInstance(that, ctorParms
-            .Select(a => a.ParameterType.IsInterface || a.ParameterType.IsAbstract || a.ParameterType == typeof(string) || a.ParameterType.IsArray ?
-            null :
-            Activator.CreateInstance(a.ParameterType, null)).ToArray());
+        var ctorArgs = ctorParms.Select(a => a.ParameterType.IsInterface || a.ParameterType.IsAbstract || a.ParameterType == typeof(string) || a.ParameterType.IsArray ?
+            null : Activator.CreateInstance(a.ParameterType, null)).ToArray();
+        return ctor.Invoke(ctorArgs);
     }
     internal static NewExpression InternalNewExpression(this Type that)
     {
@@ -151,20 +182,22 @@ public static partial class FreeSqlGlobalExtensions
         return Expression.New(ctor, ctor.GetParameters().Select(a => Expression.Constant(a.ParameterType.CreateInstanceGetDefaultValue(), a.ParameterType)));
     }
 
-    static ConcurrentDictionary<Type, ConstructorInfo> _dicInternalGetTypeConstructor0OrFirst = new ConcurrentDictionary<Type, ConstructorInfo>();
+    static ConcurrentDictionary<Type, Lazy<ConstructorInfo>> _dicInternalGetTypeConstructor0OrFirst = new ConcurrentDictionary<Type, Lazy<ConstructorInfo>>();
     internal static ConstructorInfo InternalGetTypeConstructor0OrFirst(this Type that, bool isThrow = true)
     {
         var ret = _dicInternalGetTypeConstructor0OrFirst.GetOrAdd(that, tp =>
-            tp.GetConstructor(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, new Type[0], null) ??
-            tp.GetConstructors(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic).OrderBy(a => a.IsPublic ? 0 : 1).FirstOrDefault());
-        if (ret == null && isThrow) throw new ArgumentException($"{that.FullName} 类型无方法访问构造函数");
-        return ret;
+            new Lazy<ConstructorInfo>(() => tp.GetConstructor(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, new Type[0], null) ??
+                tp.GetConstructors(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                .OrderBy(a => a.IsPublic ? 0 : 1)
+                .FirstOrDefault()));
+        if (ret.Value == null && isThrow) throw new ArgumentException(CoreErrorStrings.Type_Cannot_Access_Constructor(that.FullName));
+        return ret.Value;
     }
 
     static ConcurrentDictionary<Type, Dictionary<string, PropertyInfo>> _dicGetPropertiesDictIgnoreCase = new ConcurrentDictionary<Type, Dictionary<string, PropertyInfo>>();
     public static Dictionary<string, PropertyInfo> GetPropertiesDictIgnoreCase(this Type that) => that == null ? null : _dicGetPropertiesDictIgnoreCase.GetOrAdd(that, tp =>
     {
-        var props = that.GetProperties().GroupBy(p => p.DeclaringType).Reverse().SelectMany(p => p); //将基类的属性位置放在前面 #164
+        var props = that.GetProperties(BindingFlags.Instance | BindingFlags.Public).GroupBy(p => p.DeclaringType).Reverse().SelectMany(p => p); //将基类的属性位置放在前面 #164
         var dict = new Dictionary<string, PropertyInfo>(StringComparer.CurrentCultureIgnoreCase);
         foreach (var prop in props)
         {
@@ -173,6 +206,7 @@ public static partial class FreeSqlGlobalExtensions
                 if (existsProp.DeclaringType != prop.DeclaringType) dict[prop.Name] = prop;
                 continue;
             }
+            if (prop.GetGetMethod() == null) continue;
             dict.Add(prop.Name, prop);
         }
         return dict;
@@ -201,7 +235,8 @@ public static partial class FreeSqlGlobalExtensions
         var value = dr.GetString(index);
         var t = typeof(T);
         var fs = _dicGetFields.GetOrAdd(t, t2 => t2.GetFields());
-        foreach (var f in fs) {
+        foreach (var f in fs)
+        {
             var attr = f.GetCustomAttributes(typeof(DescriptionAttribute), false)?.FirstOrDefault() as DescriptionAttribute;
             if (attr?.Description == value || f.Name == value) return Enum.Parse(t, f.Name, true);
         }
@@ -279,11 +314,352 @@ public static partial class FreeSqlGlobalExtensions
         freesql.Select<T1>().From<T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16>((s, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p) => s);
     #endregion
 
+    #region SqlServer with(nolock)、with(index) 强制索引
+    /// <summary>
+    /// SqlServer: with(nolock)<para></para>
+    /// 达梦: with ur<para></para>
+    /// </summary>
+    /// <typeparam name="T"></typeparam>
+    /// <param name="that"></param>
+    /// <param name="lockType"></param>
+    /// <param name="rule">多表查询时的锁规则</param>
+    /// <returns></returns>
+    public static ISelect<T> WithLock<T>(this ISelect<T> that, SqlServerLock lockType = SqlServerLock.NoLock, Dictionary<Type, bool> rule = null) => LocalWithLock(that, lockType, rule);
+    public static ISelect<T1, T2> WithLock<T1, T2>(this ISelect<T1, T2> that, SqlServerLock lockType = SqlServerLock.NoLock, Dictionary<Type, bool> rule = null) where T1 : class where T2 : class => LocalWithLock(that, lockType, rule);
+    public static ISelect<T1, T2, T3> WithLock<T1, T2, T3>(this ISelect<T1, T2, T3> that, SqlServerLock lockType = SqlServerLock.NoLock, Dictionary<Type, bool> rule = null) where T1 : class where T2 : class where T3 : class => LocalWithLock(that, lockType, rule);
+    public static ISelect<T1, T2, T3, T4> WithLock<T1, T2, T3, T4>(this ISelect<T1, T2, T3, T4> that, SqlServerLock lockType = SqlServerLock.NoLock, Dictionary<Type, bool> rule = null) where T1 : class where T2 : class where T3 : class where T4 : class => LocalWithLock(that, lockType, rule);
+    public static ISelect<T1, T2, T3, T4, T5> WithLock<T1, T2, T3, T4, T5>(this ISelect<T1, T2, T3, T4, T5> that, SqlServerLock lockType = SqlServerLock.NoLock, Dictionary<Type, bool> rule = null) where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class => LocalWithLock(that, lockType, rule);
+    public static ISelect<T1, T2, T3, T4, T5, T6> WithLock<T1, T2, T3, T4, T5, T6>(this ISelect<T1, T2, T3, T4, T5, T6> that, SqlServerLock lockType = SqlServerLock.NoLock, Dictionary<Type, bool> rule = null) where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class => LocalWithLock(that, lockType, rule);
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7> WithLock<T1, T2, T3, T4, T5, T6, T7>(this ISelect<T1, T2, T3, T4, T5, T6, T7> that, SqlServerLock lockType = SqlServerLock.NoLock, Dictionary<Type, bool> rule = null) where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class => LocalWithLock(that, lockType, rule);
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7, T8> WithLock<T1, T2, T3, T4, T5, T6, T7, T8>(this ISelect<T1, T2, T3, T4, T5, T6, T7, T8> that, SqlServerLock lockType = SqlServerLock.NoLock, Dictionary<Type, bool> rule = null) where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class where T8 : class => LocalWithLock(that, lockType, rule);
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9> WithLock<T1, T2, T3, T4, T5, T6, T7, T8, T9>(this ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9> that, SqlServerLock lockType = SqlServerLock.NoLock, Dictionary<Type, bool> rule = null) where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class where T8 : class where T9 : class => LocalWithLock(that, lockType, rule);
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10> WithLock<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10>(this ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10> that, SqlServerLock lockType = SqlServerLock.NoLock, Dictionary<Type, bool> rule = null) where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class where T8 : class where T9 : class where T10 : class => LocalWithLock(that, lockType, rule);
+
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11> WithLock<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11>(this ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11> that, SqlServerLock lockType = SqlServerLock.NoLock, Dictionary<Type, bool> rule = null) where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class where T8 : class where T9 : class where T10 : class where T11 : class => LocalWithLock(that, lockType, rule);
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12> WithLock<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12>(this ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12> that, SqlServerLock lockType = SqlServerLock.NoLock, Dictionary<Type, bool> rule = null) where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class where T8 : class where T9 : class where T10 : class where T11 : class where T12 : class => LocalWithLock(that, lockType, rule);
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13> WithLock<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13>(this ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13> that, SqlServerLock lockType = SqlServerLock.NoLock, Dictionary<Type, bool> rule = null) where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class where T8 : class where T9 : class where T10 : class where T11 : class where T12 : class where T13 : class => LocalWithLock(that, lockType, rule);
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14> WithLock<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14>(this ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14> that, SqlServerLock lockType = SqlServerLock.NoLock, Dictionary<Type, bool> rule = null) where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class where T8 : class where T9 : class where T10 : class where T11 : class where T12 : class where T13 : class where T14 : class => LocalWithLock(that, lockType, rule);
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15> WithLock<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15>(this ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15> that, SqlServerLock lockType = SqlServerLock.NoLock, Dictionary<Type, bool> rule = null) where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class where T8 : class where T9 : class where T10 : class where T11 : class where T12 : class where T13 : class where T14 : class where T15 : class => LocalWithLock(that, lockType, rule);
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16> WithLock<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16>(this ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16> that, SqlServerLock lockType = SqlServerLock.NoLock, Dictionary<Type, bool> rule = null) where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class where T8 : class where T9 : class where T10 : class where T11 : class where T12 : class where T13 : class where T14 : class where T15 : class where T16 : class => LocalWithLock(that, lockType, rule);
+    static TReturn LocalWithLock<TReturn>(TReturn query, SqlServerLock lockType, Dictionary<Type, bool> rule)
+    {
+        var selectProvider = query as Select0Provider;
+        switch (selectProvider._orm.Ado.DataType)
+        {
+            case DataType.SqlServer:
+            case DataType.OdbcSqlServer:
+            case DataType.CustomSqlServer:
+                break;
+            case DataType.Dameng:
+                if ((lockType & SqlServerLock.NoLock) == SqlServerLock.NoLock &&
+                    !selectProvider._tosqlAppendContent.Contains("with ur") &&
+                    rule?.Any(r => r.Value && selectProvider._tables.Any(t => t.Table?.Type == r.Key)) == true)
+                    selectProvider._tosqlAppendContent = $"{selectProvider._tosqlAppendContent} with ur";
+                return query;
+            default:
+                return query;
+        }
+        var oldalias = selectProvider._aliasRule;
+        selectProvider._aliasRule = (type, old) =>
+        {
+            if (oldalias != null) old = oldalias(type, old);
+            if (rule == null) return LocalAppendWithString(old, lockType.ToString());
+            return rule.TryGetValue(type, out var trybool) && trybool ? LocalAppendWithString(old, lockType.ToString()) : old;
+        };
+        return query;
+    }
+    
+    /// <summary>
+    /// SqkServer with(index) 强制索引
+    /// </summary>
+    /// <typeparam name="T"></typeparam>
+    /// <param name="that"></param>
+    /// <returns></returns>
+    public static ISelect<T> WithIndex<T>(this ISelect<T> that, string indexName) => LocalWithIndex(that, indexName, null);
+    public static ISelect<T1, T2> WithIndex<T1, T2>(this ISelect<T1, T2> that, string indexName) where T1 : class where T2 : class => LocalWithIndex(that, indexName, null);
+    public static ISelect<T1, T2, T3> WithIndex<T1, T2, T3>(this ISelect<T1, T2, T3> that, string indexName) where T1 : class where T2 : class where T3 : class => LocalWithIndex(that, indexName, null);
+    public static ISelect<T1, T2, T3, T4> WithIndex<T1, T2, T3, T4>(this ISelect<T1, T2, T3, T4> that, string indexName) where T1 : class where T2 : class where T3 : class where T4 : class => LocalWithIndex(that, indexName, null);
+    public static ISelect<T1, T2, T3, T4, T5> WithIndex<T1, T2, T3, T4, T5>(this ISelect<T1, T2, T3, T4, T5> that, string indexName) where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class => LocalWithIndex(that, indexName, null);
+    public static ISelect<T1, T2, T3, T4, T5, T6> WithIndex<T1, T2, T3, T4, T5, T6>(this ISelect<T1, T2, T3, T4, T5, T6> that, string indexName) where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class => LocalWithIndex(that, indexName, null);
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7> WithIndex<T1, T2, T3, T4, T5, T6, T7>(this ISelect<T1, T2, T3, T4, T5, T6, T7> that, string indexName) where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class => LocalWithIndex(that, indexName, null);
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7, T8> WithIndex<T1, T2, T3, T4, T5, T6, T7, T8>(this ISelect<T1, T2, T3, T4, T5, T6, T7, T8> that, string indexName) where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class where T8 : class => LocalWithIndex(that, indexName, null);
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9> WithIndex<T1, T2, T3, T4, T5, T6, T7, T8, T9>(this ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9> that, string indexName) where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class where T8 : class where T9 : class => LocalWithIndex(that, indexName, null);
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10> WithIndex<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10>(this ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10> that, string indexName) where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class where T8 : class where T9 : class where T10 : class => LocalWithIndex(that, indexName, null);
+
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11> WithIndex<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11>(this ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11> that, string indexName) where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class where T8 : class where T9 : class where T10 : class where T11 : class => LocalWithIndex(that, indexName, null);
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12> WithIndex<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12>(this ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12> that, string indexName) where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class where T8 : class where T9 : class where T10 : class where T11 : class where T12 : class => LocalWithIndex(that, indexName, null);
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13> WithIndex<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13>(this ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13> that, string indexName) where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class where T8 : class where T9 : class where T10 : class where T11 : class where T12 : class where T13 : class => LocalWithIndex(that, indexName, null);
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14> WithIndex<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14>(this ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14> that, string indexName) where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class where T8 : class where T9 : class where T10 : class where T11 : class where T12 : class where T13 : class where T14 : class => LocalWithIndex(that, indexName, null);
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15> WithIndex<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15>(this ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15> that, string indexName) where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class where T8 : class where T9 : class where T10 : class where T11 : class where T12 : class where T13 : class where T14 : class where T15 : class => LocalWithIndex(that, indexName, null);
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16> WithIndex<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16>(this ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16> that, string indexName) where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class where T8 : class where T9 : class where T10 : class where T11 : class where T12 : class where T13 : class where T14 : class where T15 : class where T16 : class => LocalWithIndex(that, indexName, null);
+
+    public static ISelect<T> WithIndex<T>(this ISelect<T> that, string indexName, Dictionary<Type, string> rule) => LocalWithIndex(that, indexName, rule);
+    public static ISelect<T1, T2> WithIndex<T1, T2>(this ISelect<T1, T2> that, string indexName, Dictionary<Type, string> rule) where T1 : class where T2 : class => LocalWithIndex(that, indexName, rule);
+    public static ISelect<T1, T2, T3> WithIndex<T1, T2, T3>(this ISelect<T1, T2, T3> that, string indexName, Dictionary<Type, string> rule) where T1 : class where T2 : class where T3 : class => LocalWithIndex(that, indexName, rule);
+    public static ISelect<T1, T2, T3, T4> WithIndex<T1, T2, T3, T4>(this ISelect<T1, T2, T3, T4> that, string indexName, Dictionary<Type, string> rule) where T1 : class where T2 : class where T3 : class where T4 : class => LocalWithIndex(that, indexName, rule);
+    public static ISelect<T1, T2, T3, T4, T5> WithIndex<T1, T2, T3, T4, T5>(this ISelect<T1, T2, T3, T4, T5> that, string indexName, Dictionary<Type, string> rule) where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class => LocalWithIndex(that, indexName, rule);
+    public static ISelect<T1, T2, T3, T4, T5, T6> WithIndex<T1, T2, T3, T4, T5, T6>(this ISelect<T1, T2, T3, T4, T5, T6> that, string indexName, Dictionary<Type, string> rule) where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class => LocalWithIndex(that, indexName, rule);
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7> WithIndex<T1, T2, T3, T4, T5, T6, T7>(this ISelect<T1, T2, T3, T4, T5, T6, T7> that, string indexName, Dictionary<Type, string> rule) where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class => LocalWithIndex(that, indexName, rule);
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7, T8> WithIndex<T1, T2, T3, T4, T5, T6, T7, T8>(this ISelect<T1, T2, T3, T4, T5, T6, T7, T8> that, string indexName, Dictionary<Type, string> rule) where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class where T8 : class => LocalWithIndex(that, indexName, rule);
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9> WithIndex<T1, T2, T3, T4, T5, T6, T7, T8, T9>(this ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9> that, string indexName, Dictionary<Type, string> rule) where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class where T8 : class where T9 : class => LocalWithIndex(that, indexName, rule);
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10> WithIndex<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10>(this ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10> that, string indexName, Dictionary<Type, string> rule) where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class where T8 : class where T9 : class where T10 : class => LocalWithIndex(that, indexName, rule);
+
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11> WithIndex<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11>(this ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11> that, string indexName, Dictionary<Type, string> rule) where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class where T8 : class where T9 : class where T10 : class where T11 : class => LocalWithIndex(that, indexName, rule);
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12> WithIndex<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12>(this ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12> that, string indexName, Dictionary<Type, string> rule) where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class where T8 : class where T9 : class where T10 : class where T11 : class where T12 : class => LocalWithIndex(that, indexName, rule);
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13> WithIndex<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13>(this ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13> that, string indexName, Dictionary<Type, string> rule) where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class where T8 : class where T9 : class where T10 : class where T11 : class where T12 : class where T13 : class => LocalWithIndex(that, indexName, rule);
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14> WithIndex<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14>(this ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14> that, string indexName, Dictionary<Type, string> rule) where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class where T8 : class where T9 : class where T10 : class where T11 : class where T12 : class where T13 : class where T14 : class => LocalWithIndex(that, indexName, rule);
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15> WithIndex<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15>(this ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15> that, string indexName, Dictionary<Type, string> rule) where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class where T8 : class where T9 : class where T10 : class where T11 : class where T12 : class where T13 : class where T14 : class where T15 : class => LocalWithIndex(that, indexName, rule);
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16> WithIndex<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16>(this ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16> that, string indexName, Dictionary<Type, string> rule) where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class where T8 : class where T9 : class where T10 : class where T11 : class where T12 : class where T13 : class where T14 : class where T15 : class where T16 : class => LocalWithIndex(that, indexName, rule);
+
+    static TReturn LocalWithIndex<TReturn>(TReturn query, string indexName, Dictionary<Type, string> rule)
+    {
+        if (string.IsNullOrWhiteSpace(indexName) && rule?.Any() != true) return query;
+        var selectProvider = query as Select0Provider;
+        switch (selectProvider._orm.Ado.DataType)
+        {
+            case DataType.SqlServer:
+            case DataType.OdbcSqlServer:
+            case DataType.CustomSqlServer:
+                {
+                    var oldalias = selectProvider._aliasRule;
+                    selectProvider._aliasRule = (type, old) =>
+                    {
+                        if (oldalias != null) old = oldalias(type, old);
+                        if (string.IsNullOrWhiteSpace(indexName) == false && type == selectProvider._tables[0].Table.Type) return LocalAppendWithString(old, $"index={indexName}");
+                        if (rule == null) return old;
+                        return rule.TryGetValue(type, out var tryidxName) && string.IsNullOrWhiteSpace(tryidxName) == false ? LocalAppendWithString(old, $"index={tryidxName}") : old;
+                    };
+                }
+                break;
+            case DataType.MySql:
+            case DataType.OdbcMySql:
+            case DataType.CustomMySql:
+                {
+                    var oldalias = selectProvider._aliasRule;
+                    selectProvider._aliasRule = (type, old) =>
+                    {
+                        if (oldalias != null) old = oldalias(type, old);
+                        if (string.IsNullOrWhiteSpace(indexName) == false && type == selectProvider._tables[0].Table.Type) return LocalAppendMySqlIndex(old, indexName);
+                        if (rule == null) return old;
+                        return rule.TryGetValue(type, out var tryidxName) && string.IsNullOrWhiteSpace(tryidxName) == false ? LocalAppendMySqlIndex(old, tryidxName) : old;
+                    };
+                }
+                break;
+            case DataType.Oracle:
+            case DataType.OdbcOracle:
+            case DataType.CustomOracle:
+                {
+                    var hintParts = new List<string>();
+                    if (!string.IsNullOrEmpty(indexName) && !string.IsNullOrEmpty(selectProvider._tables[0].Alias))
+                    {
+                        string alias = selectProvider._tables[0].Alias;
+                        hintParts.Add($"INDEX({alias} {indexName})");
+                    }
+                    if (rule != null && rule.Count > 0)
+                    {
+                        var tablesMap = selectProvider._tables
+                            .Skip(1)
+                            .Where(t => !string.IsNullOrEmpty(t.Alias) && t.Table?.Type != null)
+                            .ToDictionary(t => t.Table.Type, t => t);
+                        foreach (var indexRule in rule)
+                        {
+                            if (tablesMap.TryGetValue(indexRule.Key, out var tableInfo))
+                            {
+                                string otherIndexName = indexRule.Value;
+                                if (!string.IsNullOrEmpty(otherIndexName))
+                                    hintParts.Add($"INDEX({tableInfo.Alias} {otherIndexName})");
+                            }
+                        }
+                    }
+                    if (hintParts.Count > 0)
+                    {
+                        string finalHint = $"/*+ {string.Join(" ", hintParts)} */";
+                        var _select = selectProvider._select;
+                        int selectKeywordIndex = _select.IndexOf("SELECT ", StringComparison.OrdinalIgnoreCase);
+                        if (selectKeywordIndex != -1)
+                        {
+                            int insertionPoint = selectKeywordIndex + "SELECT ".Length;
+                            selectProvider._select = _select.Insert(insertionPoint, $"{finalHint} ");
+                        }
+                    }
+                }
+                break;
+            case DataType.Sqlite:
+                {
+                    var oldalias = selectProvider._aliasRule;
+                    selectProvider._aliasRule = (type, old) =>
+                    {
+                        if (oldalias != null) old = oldalias(type, old);
+                        if (string.IsNullOrWhiteSpace(indexName) == false && type == selectProvider._tables[0].Table.Type) return LocalAppendSqliteIndex(old, indexName);
+                        if (rule == null) return old;
+                        return rule.TryGetValue(type, out var tryidxName) && string.IsNullOrWhiteSpace(tryidxName) == false ? LocalAppendSqliteIndex(old, indexName) : old;
+                    };
+                }
+                break;
+        }
+        
+        return query;
+    }
+    static string LocalAppendWithString(string old, string str) => old?.Contains(" With(") == true ? old.Replace(" With(", $" With({str}, ") : $"{old} With({str})";
+    static string LocalAppendMySqlIndex(string old, string indexName)
+    {
+        if (string.IsNullOrEmpty(old)) return $"FORCE INDEX({indexName})";
+        int forceIndexPosition = old.IndexOf("FORCE INDEX(", StringComparison.OrdinalIgnoreCase);
+        if (forceIndexPosition == -1) return $"{old} FORCE INDEX({indexName})";
+        int closingParenPosition = old.IndexOf(')', forceIndexPosition);
+        if (closingParenPosition != -1) return old.Insert(closingParenPosition, $",{indexName}");
+        return old;
+    }
+    static string LocalAppendSqliteIndex(string old, string indexName)
+    {
+        if (string.IsNullOrEmpty(old)) return $"INDEXED BY {indexName}";
+        if (old.IndexOf("INDEXED BY", StringComparison.OrdinalIgnoreCase) != -1) return old;
+        return $"{old} INDEXED BY {indexName}";
+    }
+
+    /// <summary>
+    /// 设置全局 SqlServer: with(nolock)<para></para>
+    /// 设置全局 达梦: with ur<para></para>
+    /// </summary>
+    /// <param name="that"></param>
+    public static IFreeSql SetGlobalSelectWithLock(this IFreeSql that, SqlServerLock lockType, Dictionary<Type, bool> rule)
+    {
+        var value = NativeTuple.Create(lockType, rule);
+        _dicSetGlobalSelectWithLock.AddOrUpdate(that.Ado.Identifier, value, (_, __) => value);
+        return that;
+    }
+    public static ConcurrentDictionary<Guid, NativeTuple<SqlServerLock, Dictionary<Type, bool>>> _dicSetGlobalSelectWithLock = new ConcurrentDictionary<Guid, NativeTuple<SqlServerLock, Dictionary<Type, bool>>>();
+    #endregion
+
+    #region 克隆ISelect
+    /// <summary>
+    /// 克隆 ISelect
+    /// </summary>
+    public static ISelect<T1> Clone<T1>(this ISelect<T1> query)
+        where T1 : class
+    {
+        var newQuery = (query as Select0Provider)._orm.Select<T1>();
+        Select0Provider.CopyData(query as Select0Provider, newQuery as Select0Provider, null);
+        return newQuery;
+    }
+    /// <summary>
+    /// 克隆 ISelect
+    /// </summary>
+    public static ISelect<T1, T2> Clone<T1, T2>(this ISelect<T1, T2> query)
+        where T1 : class where T2 : class
+    {
+        var newQuery = (query as Select0Provider)._orm.Select<T1, T2>();
+        Select0Provider.CopyData(query as Select0Provider, newQuery as Select0Provider, null);
+        return newQuery;
+    }
+    /// <summary>
+    /// 克隆 ISelect
+    /// </summary>
+    public static ISelect<T1, T2, T3> Clone<T1, T2, T3>(this ISelect<T1, T2, T3> query)
+        where T1 : class where T2 : class where T3 : class
+    {
+        var newQuery = (query as Select0Provider)._orm.Select<T1, T2, T3>();
+        Select0Provider.CopyData(query as Select0Provider, newQuery as Select0Provider, null);
+        return newQuery;
+    }
+    public static ISelect<T1, T2, T3, T4> Clone<T1, T2, T3, T4>(this ISelect<T1, T2, T3, T4> query)
+        where T1 : class where T2 : class where T3 : class where T4 : class
+    {
+        var newQuery = (query as Select0Provider)._orm.Select<T1, T2, T3, T4>();
+        Select0Provider.CopyData(query as Select0Provider, newQuery as Select0Provider, null);
+        return newQuery;
+    }
+    public static ISelect<T1, T2, T3, T4, T5> Clone<T1, T2, T3, T4, T5>(this ISelect<T1, T2, T3, T4, T5> query)
+        where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class
+    {
+        var newQuery = (query as Select0Provider)._orm.Select<T1, T2, T3, T4, T5>();
+        Select0Provider.CopyData(query as Select0Provider, newQuery as Select0Provider, null);
+        return newQuery;
+    }
+    public static ISelect<T1, T2, T3, T4, T5, T6> Clone<T1, T2, T3, T4, T5, T6>(this ISelect<T1, T2, T3, T4, T5, T6> query)
+        where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class
+    {
+        var newQuery = (query as Select0Provider)._orm.Select<T1, T2, T3, T4, T5, T6>();
+        Select0Provider.CopyData(query as Select0Provider, newQuery as Select0Provider, null);
+        return newQuery;
+    }
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7> Clone<T1, T2, T3, T4, T5, T6, T7>(this ISelect<T1, T2, T3, T4, T5, T6, T7> query)
+        where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class
+    {
+        var newQuery = (query as Select0Provider)._orm.Select<T1, T2, T3, T4, T5, T6, T7>();
+        Select0Provider.CopyData(query as Select0Provider, newQuery as Select0Provider, null);
+        return newQuery;
+    }
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7, T8> Clone<T1, T2, T3, T4, T5, T6, T7, T8>(this ISelect<T1, T2, T3, T4, T5, T6, T7, T8> query)
+        where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class where T8 : class
+    {
+        var newQuery = (query as Select0Provider)._orm.Select<T1, T2, T3, T4, T5, T6, T7, T8>();
+        Select0Provider.CopyData(query as Select0Provider, newQuery as Select0Provider, null);
+        return newQuery;
+    }
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9> Clone<T1, T2, T3, T4, T5, T6, T7, T8, T9>(this ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9> query)
+        where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class where T8 : class where T9 : class
+    {
+        var newQuery = (query as Select0Provider)._orm.Select<T1, T2, T3, T4, T5, T6, T7, T8, T9>();
+        Select0Provider.CopyData(query as Select0Provider, newQuery as Select0Provider, null);
+        return newQuery;
+    }
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10> Clone<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10>(this ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10> query)
+        where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class where T8 : class where T9 : class where T10 : class
+    {
+        var newQuery = (query as Select0Provider)._orm.Select<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10>();
+        Select0Provider.CopyData(query as Select0Provider, newQuery as Select0Provider, null);
+        return newQuery;
+    }
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11> Clone<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11>(this ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11> query)
+        where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class where T8 : class where T9 : class where T10 : class where T11 : class
+    {
+        var newQuery = (query as Select0Provider)._orm.Select<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11>();
+        Select0Provider.CopyData(query as Select0Provider, newQuery as Select0Provider, null);
+        return newQuery;
+    }
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12> Clone<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12>(this ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12> query)
+        where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class where T8 : class where T9 : class where T10 : class where T11 : class where T12 : class
+    {
+        var newQuery = (query as Select0Provider)._orm.Select<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12>();
+        Select0Provider.CopyData(query as Select0Provider, newQuery as Select0Provider, null);
+        return newQuery;
+    }
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13> Clone<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13>(this ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13> query)
+        where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class where T8 : class where T9 : class where T10 : class where T11 : class where T12 : class where T13 : class
+    {
+        var newQuery = (query as Select0Provider)._orm.Select<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13>();
+        Select0Provider.CopyData(query as Select0Provider, newQuery as Select0Provider, null);
+        return newQuery;
+    }
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14> Clone<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14>(this ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14> query)
+        where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class where T8 : class where T9 : class where T10 : class where T11 : class where T12 : class where T13 : class where T14 : class
+    {
+        var newQuery = (query as Select0Provider)._orm.Select<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14>();
+        Select0Provider.CopyData(query as Select0Provider, newQuery as Select0Provider, null);
+        return newQuery;
+    }
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15> Clone<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15>(this ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15> query)
+        where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class where T8 : class where T9 : class where T10 : class where T11 : class where T12 : class where T13 : class where T14 : class where T15 : class
+    {
+        var newQuery = (query as Select0Provider)._orm.Select<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15>();
+        Select0Provider.CopyData(query as Select0Provider, newQuery as Select0Provider, null);
+        return newQuery;
+    }
+    public static ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16> Clone<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16>(this ISelect<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16> query)
+        where T1 : class where T2 : class where T3 : class where T4 : class where T5 : class where T6 : class where T7 : class where T8 : class where T9 : class where T10 : class where T11 : class where T12 : class where T13 : class where T14 : class where T15 : class where T16 : class
+    {
+        var newQuery = (query as Select0Provider)._orm.Select<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16>();
+        Select0Provider.CopyData(query as Select0Provider, newQuery as Select0Provider, null);
+        return newQuery;
+    }
+    #endregion
+
     #region IncludeMany
     /// <summary>
     /// 本方法实现从已知的内存 List 数据，进行和 ISelect.IncludeMany 相同功能的贪婪加载<para></para>
-    /// 示例：new List&lt;Song&gt;(new[] { song1, song2, song3 }).IncludeMany(g.sqlite, a => a.Tags);<para></para>
-    /// 文档：https://github.com/2881099/FreeSql/wiki/%e8%b4%aa%e5%a9%aa%e5%8a%a0%e8%bd%bd#%E5%AF%BC%E8%88%AA%E5%B1%9E%E6%80%A7-onetomanymanytomany
+    /// 示例：new List&lt;Song&gt;(new[] { song1, song2, song3 }).IncludeMany(fsql, a => a.Tags);<para></para>
+    /// 文档：https://github.com/dotnetcore/FreeSql/wiki/%E8%B4%AA%E5%A9%AA%E5%8A%A0%E8%BD%BD
     /// </summary>
     /// <typeparam name="T1"></typeparam>
     /// <typeparam name="TNavigate"></typeparam>
@@ -309,7 +685,6 @@ public static partial class FreeSqlGlobalExtensions
         select.SetList(list);
         return list;
     }
-
 #if net40
 #else
     async public static Task<List<T1>> IncludeManyAsync<T1, TNavigate>(this List<T1> list, IFreeSql orm, Expression<Func<T1, IEnumerable<TNavigate>>> navigateSelector, Action<ISelect<TNavigate>> then = null, CancellationToken cancellationToken = default) where T1 : class where TNavigate : class
@@ -326,6 +701,202 @@ public static partial class FreeSqlGlobalExtensions
         return list;
     }
 #endif
+    /// <summary>
+    /// 本方法实现从已知的内存 List 数据，进行和 ISelect.IncludeMany/Include 相同功能的贪婪加载<para></para>
+    /// 集合：new List&lt;Song&gt;(new[] { song1, song2, song3 }).IncludeByPropertyName(fsql, "Tags", "ParentId=Id", 5, "Id,Name");<para></para>
+    /// 普通：new List&lt;Song&gt;(new[] { song1, song2, song3 }).IncludeByPropertyName(fsql, "Catetory"); <para></para>
+    /// －－－普通属性 where/take/select 参数将无效<para></para>
+    /// 文档：https://github.com/dotnetcore/FreeSql/wiki/%E8%B4%AA%E5%A9%AA%E5%8A%A0%E8%BD%BD
+    /// </summary>
+    /// <typeparam name="T1"></typeparam>
+    /// <param name="list"></param>
+    /// <param name="orm"></param>
+    /// <param name="property">选择一个集合或普通属性</param>
+    /// <param name="where">设置临时的子集合关系映射，格式：子类属性=T1属性，多组以逗号分割</param>
+    /// <param name="take">设置子集合只取条数</param>
+    /// <param name="select">设置子集合只查询部分字段</param>
+    /// <returns></returns>
+    /// <exception cref="ArgumentException"></exception>
+    public static List<T1> IncludeByPropertyName<T1>(this List<T1> list, IFreeSql orm, string property, string where = null, int take = 0, string select = null, Expression<Action<ISelect<object>>> then = null) where T1 : class
+    {
+#if net40
+        return IncludeByPropertyNameSyncOrAsync<T1>(false, list, orm, property, where, take, select, then);
+#else
+        var task = IncludeByPropertyNameSyncOrAsync<T1>(false, list, orm, property, where, take, select, then);
+        if (task.Exception != null) throw task.Exception.InnerException ?? task.Exception;
+        return task.Result;
+#endif
+    }
+#if net40
+#else
+    public static Task<List<T1>> IncludeByPropertyNameAsync<T1>(this List<T1> list, IFreeSql orm, string property, string where = null, int take = 0, string select = null, Expression<Action<ISelect<object>>> then = null) where T1 : class
+    {
+        return IncludeByPropertyNameSyncOrAsync<T1>(true, list, orm, property, where, take, select, then);
+    }
+#endif
+    static
+#if net40
+        List<T1>
+#else
+        async Task<List<T1>>
+#endif
+        IncludeByPropertyNameSyncOrAsync<T1>(bool isAsync, List<T1> list, IFreeSql orm, string property, string where, int take, string select, Expression<Action<ISelect<object>>> then) where T1 : class
+    {
+        if (list?.Any() != true) return list;
+        var entityType = typeof(T1) == typeof(object) ? list[0].GetType() : typeof(T1);
+        var t1tb = orm.CodeFirst.GetTableByEntity(entityType);
+        if (orm.CodeFirst.IsAutoSyncStructure)
+        {
+            if (t1tb == null || t1tb.Primarys.Any() == false)
+                (orm.CodeFirst as CodeFirstProvider)._dicSycedTryAdd(entityType); //._dicSyced.TryAdd(typeof(TReturn), true);
+        }
+        var props = property.Split('.');
+        var t1sel = orm.Select<object>().AsType(entityType) as Select1Provider<object>;
+        var t1expFul = t1sel.ConvertStringPropertyToExpression(property, true);
+        var t1exp = props.Length == 1 ? t1expFul : t1sel.ConvertStringPropertyToExpression(props[0], true);
+        if (t1expFul == null) throw new ArgumentException(CoreErrorStrings.Cannot_Resolve_ExpressionTree(nameof(property)));
+        var propElementType = t1expFul.Type.GetGenericArguments().FirstOrDefault() ?? t1expFul.Type.GetElementType();
+        if (propElementType != null) //IncludeMany
+        {
+            if (props.Length > 1)
+                IncludeByPropertyName(list, orm, string.Join(".", props.Take(props.Length - 1)));
+            var imsel = IncludeManyByPropertyNameCommonGetSelect(orm, entityType, property, where, take, select, then);
+#if net40
+            imsel.SetList(list);
+#else
+            if (isAsync) await imsel.SetListAsync(list);
+            else imsel.SetList(list);
+#endif
+            return list;
+        }
+        var tbtr = t1tb.GetTableRef(props[0], true, true);
+        if (tbtr == null) throw new ArgumentException(CoreErrorStrings.ParameterError_NotValid_Navigation(nameof(property)));
+        var reftb = orm.CodeFirst.GetTableByEntity(t1exp.Type);
+        var refsel = orm.Select<object>().AsType(t1exp.Type) as Select1Provider<object>;
+        if (props.Length > 1)
+            refsel.IncludeByPropertyName(string.Join(".", props.Skip(1)));
+
+        var listdic = list.Select(item =>
+        {
+            var refitem = t1exp.Type.CreateInstanceGetDefaultValue();
+            for (var a = 0; a < tbtr.Columns.Count; a++)
+            {
+                var colval = FreeSql.Extensions.EntityUtil.EntityUtilExtensions.GetPropertyValue(t1tb, item, tbtr.Columns[a].CsName);
+                FreeSql.Extensions.EntityUtil.EntityUtilExtensions.SetPropertyValue(reftb, refitem, tbtr.RefColumns[a].CsName, colval);
+            }
+            return new
+            {
+                item,
+                refitem,
+                key = FreeSql.Extensions.EntityUtil.EntityUtilExtensions.GetEntityKeyString(orm, reftb.Type, refitem, false)
+            };
+        }).GroupBy(a => a.key).ToDictionary(a => a.Key, a => a);
+        refsel.WhereDynamic(listdic.Values.Select(a => a.First().refitem).ToList());
+
+#if net40
+        var reflist = refsel.ToList();
+#else
+        var reflist = isAsync ? await refsel.ToListAsync() : refsel.ToList();
+#endif
+
+        reflist.ForEach(refitem =>
+        {
+            var key = FreeSql.Extensions.EntityUtil.EntityUtilExtensions.GetEntityKeyString(orm, reftb.Type, refitem, false);
+            foreach (var listitem in listdic[key])
+                FreeSql.Extensions.EntityUtil.EntityUtilExtensions.SetPropertyValue(t1tb, listitem.item, property, refitem);
+        });
+        return list;
+    }
+    static Select1Provider<object> IncludeManyByPropertyNameCommonGetSelect(IFreeSql orm, Type entityType, string property, string where, int take, string select, Expression<Action<ISelect<object>>> then)
+    {
+        if (orm.CodeFirst.IsAutoSyncStructure)
+        {
+            var tb = orm.CodeFirst.GetTableByEntity(entityType);
+            if (tb == null || tb.Primarys.Any() == false)
+                (orm.CodeFirst as CodeFirstProvider)._dicSycedTryAdd(entityType); //._dicSyced.TryAdd(typeof(TReturn), true);
+        }
+        var sel = orm.Select<object>().AsType(entityType) as Select1Provider<object>;
+        var exp = sel.ConvertStringPropertyToExpression(property, true);
+        if (exp == null) throw new ArgumentException(CoreErrorStrings.Cannot_Resolve_ExpressionTree(nameof(property)));
+        var memExp = exp as MemberExpression;
+        if (memExp == null) throw new ArgumentException($"{CoreErrorStrings.Cannot_Resolve_ExpressionTree(nameof(property))}2");
+        var parTb = orm.CodeFirst.GetTableByEntity(memExp.Expression.Type);
+        if (parTb == null) throw new ArgumentException($"{CoreErrorStrings.Cannot_Resolve_ExpressionTree(nameof(property))}3");
+        var propElementType = exp.Type.GetGenericArguments().FirstOrDefault() ?? exp.Type.GetElementType();
+        var reftb = orm.CodeFirst.GetTableByEntity(propElementType);
+        if (reftb == null) throw new ArgumentException(CoreErrorStrings.ParameterError_NotValid_Collection(nameof(property)));
+
+        if (string.IsNullOrWhiteSpace(where) == false)
+        {
+            var refparamExp = Expression.Parameter(reftb.Type);
+            var reffuncType = typeof(Func<,>).MakeGenericType(reftb.Type, typeof(bool));
+            var refWhereMethod = Select0Provider.GetMethodEnumerable("Where").MakeGenericMethod(reftb.Type);
+
+            var whereSplit = where.Split(',');
+            Expression whereExp = null;
+            for (var a = 0; a < whereSplit.Length; a++)
+            {
+                var keyval = whereSplit[a].Split('=').Select(x => x.Trim()).Where(x => string.IsNullOrWhiteSpace(x) == false).ToArray();
+                if (keyval.Length != 2) throw new ArgumentException(CoreErrorStrings.ParameterError_NotValid_UseCommas(nameof(where)));
+
+                if (reftb.ColumnsByCs.TryGetValue(keyval[0], out var keycol) == false)
+                    throw new ArgumentException(CoreErrorStrings.ParameterError_NotValid_PropertyName(nameof(where), keyval[0], reftb.Type.DisplayCsharp()));
+                if (parTb.ColumnsByCs.TryGetValue(keyval[1], out var valcol) == false)
+                    throw new ArgumentException(CoreErrorStrings.ParameterError_NotValid_PropertyName(nameof(where), keyval[1], parTb.Type.DisplayCsharp()));
+
+                var tmpExp = Expression.Equal(
+                    Expression.Convert(Expression.MakeMemberAccess(refparamExp, reftb.Properties[keyval[0]]), valcol.CsType),
+                    Expression.MakeMemberAccess(memExp.Expression, parTb.Properties[keyval[1]]));
+                whereExp = whereExp == null ? tmpExp : Expression.And(whereExp, tmpExp);
+            }
+            whereExp = Expression.Lambda(reffuncType, whereExp, refparamExp);
+            exp = Expression.Call(refWhereMethod, exp, whereExp);
+        }
+        if (take > 0)
+        {
+            var takeMethod = Select0Provider.GetMethodEnumerable("Take").MakeGenericMethod(reftb.Type);
+            exp = Expression.Call(takeMethod, exp, Expression.Constant(take, typeof(int)));
+        }
+        if (select?.Any() == true)
+        {
+            var refparamExp = Expression.Parameter(reftb.Type);
+            var reffuncType = typeof(Func<,>).MakeGenericType(reftb.Type, reftb.Type);
+            var refWhereMethod = Select0Provider.GetMethodEnumerable("Select").MakeGenericMethod(reftb.Type, reftb.Type);
+
+            Expression memberInitExp = Expression.MemberInit(
+                reftb.Type.InternalNewExpression(),
+                select.Split(',').Select(x => x.Trim()).Where(x => string.IsNullOrWhiteSpace(x) == false).Select(a =>
+                {
+                    if (reftb.ColumnsByCs.TryGetValue(a, out var col) == false)
+                        throw new ArgumentException(CoreErrorStrings.ParameterError_NotValid_PropertyName(nameof(select), a, reftb.Type.DisplayCsharp()));
+                    return Expression.Bind(reftb.Properties[col.CsName], Expression.MakeMemberAccess(refparamExp, reftb.Properties[col.CsName]));
+                }).ToArray());
+
+            memberInitExp = Expression.Lambda(reffuncType, memberInitExp, refparamExp);
+            exp = Expression.Call(refWhereMethod, exp, memberInitExp);
+        }
+        Delegate newthen = null;
+        if (then != null)
+        {
+            var newthenParm = Expression.Parameter(typeof(ISelect<>).MakeGenericType(reftb.Type));
+            var newthenLambdaBody = new Select1Provider<object>.ReplaceIncludeByPropertyNameParameterVisitor().Modify(then, newthenParm);
+            var newthenLambda = Expression.Lambda(typeof(Action<>).MakeGenericType(newthenParm.Type), newthenLambdaBody, newthenParm);
+            newthen = newthenLambda.Compile();
+        }
+
+        var funcType = typeof(Func<,>).MakeGenericType(typeof(object), typeof(IEnumerable<>).MakeGenericType(reftb.Type));
+        if (sel._tables[0].Table.Type != typeof(object))
+        {
+            var expParm = Expression.Parameter(typeof(object), sel._tables[0].Alias);
+            exp = new Select0Provider.ReplaceMemberExpressionVisitor().Replace(exp, sel._tables[0].Parameter, Expression.Convert(expParm, sel._tables[0].Table.Type));
+            sel._tables[0].Parameter = expParm;
+        }
+        var navigateSelector = Expression.Lambda(funcType, exp, sel._tables[0].Parameter);
+        var incMethod = sel.GetType().GetMethod("IncludeMany");
+        if (incMethod == null) throw new Exception(CoreErrorStrings.RunTimeError_Reflection_IncludeMany);
+        incMethod.MakeGenericMethod(reftb.Type).Invoke(sel, new object[] { navigateSelector, newthen });
+        return sel;
+    }
     #endregion
 
     #region ToTreeList() 父子分类
@@ -340,10 +911,8 @@ public static partial class FreeSqlGlobalExtensions
     {
         var select = that as Select1Provider<T1>;
         var tb = select._tables[0].Table;
-        var navs = tb.Properties.Select(a => tb.GetTableRef(a.Key, false))
-            .Where(a => a != null &&
-                a.RefType == FreeSql.Internal.Model.TableRefType.OneToMany &&
-                a.RefEntityType == tb.Type).ToArray();
+        var navs = tb.GetAllTableRef().Where(a => a.Value.Exception == null).Select(a => a.Value)
+            .Where(a => a.RefType == FreeSql.Internal.Model.TableRefType.OneToMany && a.RefEntityType == tb.Type).ToArray();
 
         var list = select.ToList();
         if (navs.Length != 1) return list;
@@ -363,10 +932,8 @@ public static partial class FreeSqlGlobalExtensions
     {
         var select = that as Select1Provider<T1>;
         var tb = select._tables[0].Table;
-        var navs = tb.Properties.Select(a => tb.GetTableRef(a.Key, false))
-            .Where(a => a != null &&
-                a.RefType == FreeSql.Internal.Model.TableRefType.OneToMany &&
-                a.RefEntityType == tb.Type).ToArray();
+        var navs = tb.GetAllTableRef().Where(a => a.Value.Exception == null).Select(a => a.Value)
+            .Where(a => a.RefType == FreeSql.Internal.Model.TableRefType.OneToMany && a.RefEntityType == tb.Type).ToArray();
 
         var list = await select.ToListAsync(false, cancellationToken);
         if (navs.Length != 1) return list;
@@ -407,17 +974,22 @@ public static partial class FreeSqlGlobalExtensions
         var select = that as Select1Provider<T1>;
         select._is_AsTreeCte = true;
         var tb = select._tables[0].Table;
-        var navs = tb.Properties.Select(a => tb.GetTableRef(a.Key, false))
-            .Where(a => a != null &&
-                a.RefType == FreeSql.Internal.Model.TableRefType.OneToMany &&
-                a.RefEntityType == tb.Type).ToArray();
+        var navs = tb.GetAllTableRef().Where(a => a.Value.Exception == null).Select(a => a.Value)
+            .Where(a => a.RefType == FreeSql.Internal.Model.TableRefType.OneToMany && a.RefEntityType == tb.Type).ToArray();
 
-        if (navs.Length != 1) throw new ArgumentException($"{tb.Type.FullName} 不是父子关系，无法使用该功能");
+        if (navs.Length != 1) throw new ArgumentException(CoreErrorStrings.Entity_NotParentChild_Relationship(tb.Type.FullName));
         var tbref = navs[0];
 
         var cteName = "as_tree_cte";
         if (select._orm.CodeFirst.IsSyncStructureToLower) cteName = cteName.ToLower();
         if (select._orm.CodeFirst.IsSyncStructureToUpper) cteName = cteName.ToUpper();
+
+        var tableRule = select._tableRule;
+        var tbDbName = (tableRule?.Invoke(tb.Type, tb.DbName) ?? tb.DbName);
+        if (select._orm.CodeFirst.IsSyncStructureToLower) tbDbName = tbDbName.ToLower();
+        if (select._orm.CodeFirst.IsSyncStructureToUpper) tbDbName = tbDbName.ToUpper();
+        if (select._orm.CodeFirst.IsAutoSyncStructure)
+            select._orm.CodeFirst.SyncStructure(tb.Type, tbDbName);
 
         switch (select._orm.Ado.DataType)
         {
@@ -439,6 +1011,7 @@ public static partial class FreeSqlGlobalExtensions
                 return select;
             case DataType.MySql: //MySql5.6
             case DataType.OdbcMySql:
+            case DataType.CustomMySql:
                 var mysqlConnectionString = select._orm.Ado?.ConnectionString ?? select._connection?.ConnectionString ?? "";
                 if (_dicMySqlVersion.TryGetValue(mysqlConnectionString, out var mysqlVersion) == false)
                 {
@@ -458,7 +1031,7 @@ public static partial class FreeSqlGlobalExtensions
                 }
                 if (int.TryParse((mysqlVersion ?? "").Split('.')[0], out var mysqlVersionFirst) && mysqlVersionFirst < 8)
                 {
-                    if (tbref.Columns.Count > 1) throw new ArgumentException($"{tb.Type.FullName} 是父子关系，但是 MySql 8.0 以下版本中不支持组合多主键");
+                    if (tbref.Columns.Count > 1) throw new ArgumentException(CoreErrorStrings.Entity_MySQL_VersionsBelow8_NotSupport_Multiple_PrimaryKeys(tb.Type.FullName));
                     var mysql56Sql = "";
                     if (up == false)
                     {
@@ -466,16 +1039,16 @@ public static partial class FreeSqlGlobalExtensions
   FROM (
     SELECT @cte_ids as cte_ids, (
       SELECT @cte_ids := group_concat({select._commonUtils.QuoteSqlName(tbref.Columns[0].Attribute.Name)}) 
-      FROM {select._commonUtils.QuoteSqlName(tb.DbName)} 
+      FROM {select._commonUtils.QuoteSqlName(tbDbName)} 
       WHERE find_in_set({select._commonUtils.QuoteSqlName(tbref.RefColumns[0].Attribute.Name)}, @cte_ids)
     ) as cte_cids, @cte_level := @cte_idcte_levels + 1 as cte_level
-    FROM {select._commonUtils.QuoteSqlName(tb.DbName)}, (
+    FROM {select._commonUtils.QuoteSqlName(tbDbName)}, (
       SELECT @cte_ids := a.{select._commonUtils.QuoteSqlName(tbref.Columns[0].Attribute.Name)}, @cte_idcte_levels := 0 
-      FROM {select._commonUtils.QuoteSqlName(tb.DbName)} a
+      FROM {select._commonUtils.QuoteSqlName(tbDbName)} a
       WHERE 1=1{select._where}
       LIMIT 1) cte_tbb
     WHERE @cte_ids IS NOT NULL
-  ) cte_tbc, {select._commonUtils.QuoteSqlName(tb.DbName)} a
+  ) cte_tbc, {select._commonUtils.QuoteSqlName(tbDbName)} a
   WHERE find_in_set(a.{select._commonUtils.QuoteSqlName(tbref.Columns[0].Attribute.Name)}, cte_tbc.cte_ids)";
                         select.WithSql(mysql56Sql).OrderBy("a.cte_level DESC");
                         select._where.Clear();
@@ -483,14 +1056,14 @@ public static partial class FreeSqlGlobalExtensions
                     }
                     mysql56Sql = $@"SELECT cte_tbc.cte_level, {select.GetAllFieldExpressionTreeLevel2().Field}
 FROM (
-    SELECT @cte_pid as cte_id, (SELECT @cte_pid := {select._commonUtils.QuoteSqlName(tbref.RefColumns[0].Attribute.Name)} FROM {select._commonUtils.QuoteSqlName(tb.DbName)} WHERE {select._commonUtils.QuoteSqlName(tbref.Columns[0].Attribute.Name)} = cte_id) as cte_pid, @cte_level := @cte_level + 1 as cte_level
-    FROM {select._commonUtils.QuoteSqlName(tb.DbName)}, (
+    SELECT @cte_pid as cte_id, (SELECT @cte_pid := {select._commonUtils.QuoteSqlName(tbref.RefColumns[0].Attribute.Name)} FROM {select._commonUtils.QuoteSqlName(tbDbName)} WHERE {select._commonUtils.QuoteSqlName(tbref.Columns[0].Attribute.Name)} = cte_id) as cte_pid, @cte_level := @cte_level + 1 as cte_level
+    FROM {select._commonUtils.QuoteSqlName(tbDbName)}, (
       SELECT @cte_pid := a.{select._commonUtils.QuoteSqlName(tbref.Columns[0].Attribute.Name)}, @cte_level := 0 
-      FROM {select._commonUtils.QuoteSqlName(tb.DbName)} a
+      FROM {select._commonUtils.QuoteSqlName(tbDbName)} a
       WHERE 1=1{select._where}
       LIMIT 1) cte_tbb
 ) cte_tbc
-JOIN {select._commonUtils.QuoteSqlName(tb.DbName)} a ON cte_tbc.cte_id = a.{select._commonUtils.QuoteSqlName(tbref.Columns[0].Attribute.Name)}";
+JOIN {select._commonUtils.QuoteSqlName(tbDbName)} a ON cte_tbc.cte_id = a.{select._commonUtils.QuoteSqlName(tbref.Columns[0].Attribute.Name)}";
                     select.WithSql(mysql56Sql).OrderBy("a.cte_level");
                     select._where.Clear();
                     return select;
@@ -498,7 +1071,9 @@ JOIN {select._commonUtils.QuoteSqlName(tb.DbName)} a ON cte_tbc.cte_id = a.{sele
                 break;
         }
 
+        var sql1cteLevel = "0 as cte_level";
         var sql1ctePath = "";
+        string wct2ctePath = null;
         if (pathSelector != null)
         {
             select._tables[0].Parameter = pathSelector?.Parameters[0];
@@ -506,26 +1081,49 @@ JOIN {select._commonUtils.QuoteSqlName(tb.DbName)} a ON cte_tbc.cte_id = a.{sele
             {
                 case DataType.PostgreSQL:
                 case DataType.OdbcPostgreSQL:
+                case DataType.CustomPostgreSQL:
                 case DataType.KingbaseES:
-                case DataType.OdbcKingbaseES:
                 case DataType.ShenTong: //神通测试未通过
                 case DataType.SqlServer:
                 case DataType.OdbcSqlServer:
+                case DataType.CustomSqlServer:
                 case DataType.Firebird:
                 case DataType.ClickHouse:
-                    sql1ctePath = select._commonExpression.ExpressionWhereLambda(select._tables, Expression.Call(typeof(Convert).GetMethod("ToString", new Type[] { typeof(string) }), pathSelector?.Body), null, null, null);
+                case DataType.DuckDB:
+                case DataType.Xugu:
+                    sql1ctePath = select._commonExpression.ExpressionWhereLambda(select._tables, select._tableRule, 
+                        Expression.Call(typeof(Convert).GetMethod("ToString", new Type[] { typeof(string) }), pathSelector?.Body), select._diymemexpWithTempQuery, null, null);
+                    break;
+                case DataType.MySql:
+                case DataType.OdbcMySql:
+                case DataType.CustomMySql:
+                    sql1ctePath = select._commonExpression.ExpressionWhereLambda(select._tables, select._tableRule, pathSelector?.Body, select._diymemexpWithTempQuery, null, null);
+                    sql1ctePath = $"CAST({sql1ctePath} as char(2000))";
                     break;
                 default:
-                    sql1ctePath = select._commonExpression.ExpressionWhereLambda(select._tables, pathSelector?.Body, null, null, null);
+                    sql1ctePath = select._commonExpression.ExpressionWhereLambda(select._tables, select._tableRule, pathSelector?.Body, select._diymemexpWithTempQuery, null, null);
                     break;
             }
             sql1ctePath = $"{sql1ctePath} as cte_path, ";
         }
-        var sql1 = select.ToSql($"0 as cte_level, {sql1ctePath}{select.GetAllFieldExpressionTreeLevel2(false).Field}").Trim();
+        switch (select._orm.Ado.DataType)
+        {
+            case DataType.PostgreSQL:
+            case DataType.OdbcPostgreSQL:
+            case DataType.CustomPostgreSQL:
+                sql1cteLevel = "0::int4 as cte_level";
+                break;
+            case DataType.KingbaseES:
+            case DataType.ShenTong:
+                sql1cteLevel = "0::BIGINT as cte_level";
+                break;
+        }
+        var sql1 = select.ToSql($"{sql1cteLevel}, {sql1ctePath}{select.GetAllFieldExpressionTreeLevel2(false).Field}").Trim();
 
         select._where.Clear();
         select.As("wct2");
         var sql2Field = select.GetAllFieldExpressionTreeLevel2(false).Field;
+        if (sql2Field == "*") sql2Field = "wct2.*";
         var sql2InnerJoinOn = up == false ?
             string.Join(" and ", tbref.Columns.Select((a, z) => $"wct2.{select._commonUtils.QuoteSqlName(tbref.RefColumns[z].Attribute.Name)} = wct1.{select._commonUtils.QuoteSqlName(a.Attribute.Name)}")) :
             string.Join(" and ", tbref.Columns.Select((a, z) => $"wct2.{select._commonUtils.QuoteSqlName(a.Attribute.Name)} = wct1.{select._commonUtils.QuoteSqlName(tbref.RefColumns[z].Attribute.Name)}"));
@@ -534,7 +1132,18 @@ JOIN {select._commonUtils.QuoteSqlName(tb.DbName)} a ON cte_tbc.cte_id = a.{sele
         if (pathSelector != null)
         {
             select._tables[0].Parameter = pathSelector?.Parameters[0];
-            var wct2ctePath = select._commonExpression.ExpressionWhereLambda(select._tables, pathSelector?.Body, null, null, null);
+            if (wct2ctePath == null)
+            {
+                wct2ctePath = select._commonExpression.ExpressionWhereLambda(select._tables, select._tableRule, pathSelector?.Body, select._diymemexpWithTempQuery, null, null);
+                switch (select._orm.Ado.DataType)
+                {
+                    case DataType.MySql:
+                    case DataType.OdbcMySql:
+                    case DataType.CustomMySql:
+                        wct2ctePath = $"CAST({wct2ctePath} as char(2000))";
+                        break;
+                }
+            }
             sql2ctePath = select._commonUtils.StringConcat(
                 new string[] {
                     up == false ? "wct1.cte_path" : wct2ctePath,
@@ -549,10 +1158,12 @@ JOIN {select._commonUtils.QuoteSqlName(tb.DbName)} a ON cte_tbc.cte_id = a.{sele
         }
         if (select._orm.CodeFirst.IsAutoSyncStructure)
             (select._orm.CodeFirst as CodeFirstProvider)._dicSycedTryAdd(tb.Type, cteName); //#476
+
+        select._tableRules.Clear();
         var sql2 = select
             .AsAlias((type, old) => type == tb.Type ? old.Replace("wct2", "wct1") : old)
-            .AsTable((type, old) => type == tb.Type ? cteName : old)
-            .InnerJoin($"{select._commonUtils.QuoteSqlName(tb.DbName)} wct2 ON {sql2InnerJoinOn}")
+            .AsTable((type, old) => type == tb.Type ? cteName : (tableRule?.Invoke(type, old) ?? old))
+            .InnerJoin($"{select._commonUtils.QuoteSqlName(tbDbName)} wct2 ON {sql2InnerJoinOn}")
             .ToSql($"wct1.cte_level + 1 as cte_level, {sql2ctePath}{sql2Field}").Trim();
 
         var newSelect = select._orm.Select<T1>()
@@ -575,18 +1186,21 @@ JOIN {select._commonUtils.QuoteSqlName(tb.DbName)} a ON cte_tbc.cte_id = a.{sele
 #endif
 
         var nsselsb = new StringBuilder();
-        if (AdoProvider.IsFromSlave(select._select) == false) nsselsb.Append(' '); //读写分离规则，如果强制读主库，则在前面加个空格
+        if (AdoProvider.IsFromSlave(select._select, CommandType.Text) == false) nsselsb.Append(' '); //读写分离规则，如果强制读主库，则在前面加个空格
         nsselsb.Append("WITH ");
         switch (select._orm.Ado.DataType)
         {
             case DataType.PostgreSQL:
             case DataType.OdbcPostgreSQL:
+            case DataType.CustomPostgreSQL:
             case DataType.KingbaseES:
-            case DataType.OdbcKingbaseES:
             case DataType.ShenTong: //神通测试未通过
             case DataType.MySql:
             case DataType.OdbcMySql:
+            case DataType.CustomMySql:
             case DataType.Firebird:
+            case DataType.DuckDB:
+            case DataType.Xugu:
                 nsselsb.Append("RECURSIVE ");
                 break;
         }
@@ -595,8 +1209,8 @@ JOIN {select._commonUtils.QuoteSqlName(tb.DbName)} a ON cte_tbc.cte_id = a.{sele
         {
             case DataType.Oracle: //[Err] ORA-32039: recursive WITH clause must have column alias list
             case DataType.OdbcOracle:
+            case DataType.CustomOracle:
             case DataType.Dameng: //递归 WITH 子句必须具有列别名列表
-            case DataType.OdbcDameng:
             case DataType.GBase:
                 nsselsb.Append($"(cte_level, {(pathSelector == null ? "" : "cte_path, ")}{sql2Field.Replace("wct2.", "")})");
                 break;
@@ -614,10 +1228,9 @@ SELECT ");
     #endregion
 
     #region OrderBy Random 随机排序
-
     /// <summary>
     /// 随机排序<para></para>
-    /// 支持：MySql/SqlServer/PostgreSQL/Oracle/Sqlite/Firebird/达梦/金仓/神通<para></para>
+    /// 支持：MySql/SqlServer/PostgreSQL/Oracle/Sqlite/Firebird/DuckDB/达梦/金仓/神通<para></para>
     /// 不支持：MsAcess
     /// </summary>
     /// <returns></returns>
@@ -628,21 +1241,25 @@ SELECT ");
         {
             case DataType.MySql:
             case DataType.OdbcMySql:
+            case DataType.CustomMySql:
             case DataType.ClickHouse:
                 return that.OrderBy("rand()");
             case DataType.SqlServer:
             case DataType.OdbcSqlServer:
+            case DataType.CustomSqlServer:
                 return that.OrderBy("newid()");
             case DataType.PostgreSQL:
             case DataType.OdbcPostgreSQL:
+            case DataType.CustomPostgreSQL:
             case DataType.KingbaseES:
-            case DataType.OdbcKingbaseES:
             case DataType.ShenTong:
+            case DataType.DuckDB:
+            case DataType.Xugu:
                 return that.OrderBy("random()");
             case DataType.Oracle:
-            case DataType.Dameng:
             case DataType.OdbcOracle:
-            case DataType.OdbcDameng:
+            case DataType.CustomOracle:
+            case DataType.Dameng:
                 return that.OrderBy("dbms_random.value");
             case DataType.Sqlite:
                 return that.OrderBy("random()");
@@ -651,11 +1268,11 @@ SELECT ");
             case DataType.Firebird:
                 return that.OrderBy("rand()");
         }
-        throw new NotSupportedException($"{s0p._orm.Ado.DataType} 不支持 OrderByRandom 随机排序");
+        throw new NotSupportedException($"{CoreErrorStrings.Not_Support_OrderByRandom(s0p._orm.Ado.DataType)}");
     }
     #endregion
 
-    #region IFreeSql Insert/Update/InsertOrUpdate/Delete Dictionary<string, object>
+    #region InsertDict/UpdateDict/InsertOrUpdateDict/DeleteDict
     /// <summary>
     /// 插入数据字典 Dictionary&lt;string, object&gt;
     /// </summary>
@@ -663,6 +1280,7 @@ SELECT ");
     /// <returns></returns>
     public static InsertDictImpl InsertDict(this IFreeSql freesql, Dictionary<string, object> source)
     {
+        LocalReplaceDictDBNullValue(source);
         var insertDict = new InsertDictImpl(freesql);
         insertDict._insertProvider.AppendData(source);
         return insertDict;
@@ -674,9 +1292,20 @@ SELECT ");
     /// <returns></returns>
     public static InsertDictImpl InsertDict(this IFreeSql freesql, IEnumerable<Dictionary<string, object>> source)
     {
+        if (source?.Any() == true) foreach (var dict in source) LocalReplaceDictDBNullValue(dict);
         var insertDict = new InsertDictImpl(freesql);
         insertDict._insertProvider.AppendData(source);
         return insertDict;
+    }
+    static void LocalReplaceDictDBNullValue(Dictionary<string, object> dict)
+    {
+        if (dict == null) return;
+        var keys = dict.Keys.ToArray();
+        foreach (var key in keys)
+        {
+            var val = dict[key];
+            if (val == DBNull.Value) dict[key] = null;
+        }
     }
     /// <summary>
     /// 更新数据字典 Dictionary&lt;string, object&gt;
@@ -685,6 +1314,7 @@ SELECT ");
     /// <returns></returns>
     public static UpdateDictImpl UpdateDict(this IFreeSql freesql, Dictionary<string, object> source)
     {
+        LocalReplaceDictDBNullValue(source);
         var updateDict = new UpdateDictImpl(freesql);
         updateDict._updateProvider.SetSource(source);
         return updateDict;
@@ -696,6 +1326,7 @@ SELECT ");
     /// <returns></returns>
     public static UpdateDictImpl UpdateDict(this IFreeSql freesql, IEnumerable<Dictionary<string, object>> source)
     {
+        if (source?.Any() == true) foreach (var dict in source) LocalReplaceDictDBNullValue(dict);
         var updateDict = new UpdateDictImpl(freesql);
         updateDict._updateProvider.SetSource(source);
         return updateDict;
@@ -707,6 +1338,7 @@ SELECT ");
     /// SqlServer 2008+: merge into<para></para>
     /// Oracle 11+: merge into<para></para>
     /// Sqlite: replace into<para></para>
+    /// DuckDB: on conflict do update<para></para>
     /// 达梦: merge into<para></para>
     /// 人大金仓：on conflict do update<para></para>
     /// 神通：merge into<para></para>
@@ -716,12 +1348,14 @@ SELECT ");
     /// <returns></returns>
     public static InsertOrUpdateDictImpl InsertOrUpdateDict(this IFreeSql freesql, Dictionary<string, object> source)
     {
+        LocalReplaceDictDBNullValue(source);
         var insertOrUpdateDict = new InsertOrUpdateDictImpl(freesql);
         insertOrUpdateDict._insertOrUpdateProvider.SetSource(source);
         return insertOrUpdateDict;
     }
     public static InsertOrUpdateDictImpl InsertOrUpdateDict(this IFreeSql freesql, IEnumerable<Dictionary<string, object>> source)
     {
+        if (source?.Any() == true) foreach (var dict in source) LocalReplaceDictDBNullValue(dict);
         var insertOrUpdateDict = new InsertOrUpdateDictImpl(freesql);
         insertOrUpdateDict._insertOrUpdateProvider.SetSource(source);
         return insertOrUpdateDict;
@@ -733,10 +1367,11 @@ SELECT ");
     /// <returns></returns>
     public static DeleteDictImpl DeleteDict(this IFreeSql freesql, Dictionary<string, object> source)
     {
+        LocalReplaceDictDBNullValue(source);
         var deleteDict = new DeleteDictImpl(freesql);
         UpdateProvider<Dictionary<string, object>>.GetDictionaryTableInfo(source, deleteDict._deleteProvider._orm, ref deleteDict._deleteProvider._table);
         var primarys = UpdateDictImpl.GetPrimarys(deleteDict._deleteProvider._table, source.Keys.ToArray());
-        deleteDict._deleteProvider.Where(deleteDict._deleteProvider._commonUtils.WhereItems(primarys, "", new[] { source }));
+        deleteDict._deleteProvider.Where(deleteDict._deleteProvider._commonUtils.WhereItems(primarys, "", new[] { source }, deleteDict._deleteProvider._params));
         return deleteDict;
     }
     /// <summary>
@@ -746,6 +1381,7 @@ SELECT ");
     /// <returns></returns>
     public static DeleteDictImpl DeleteDict(this IFreeSql freesql, IEnumerable<Dictionary<string, object>> source)
     {
+        if (source?.Any() == true) foreach (var dict in source) LocalReplaceDictDBNullValue(dict);
         DeleteDictImpl deleteDict = null;
         if (source.Select(a => string.Join(",", a.Keys)).Distinct().Count() == 1)
         {
@@ -753,7 +1389,7 @@ SELECT ");
             var sourceFirst = source.FirstOrDefault();
             UpdateProvider<Dictionary<string, object>>.GetDictionaryTableInfo(sourceFirst, deleteDict._deleteProvider._orm, ref deleteDict._deleteProvider._table);
             var primarys = UpdateDictImpl.GetPrimarys(deleteDict._deleteProvider._table, sourceFirst.Keys.ToArray());
-            deleteDict._deleteProvider.Where(deleteDict._deleteProvider._commonUtils.WhereItems(primarys, "", source));
+            deleteDict._deleteProvider.Where(deleteDict._deleteProvider._commonUtils.WhereItems(primarys, "", source, deleteDict._deleteProvider._params));
             return deleteDict;
         }
         foreach (var item in source)
@@ -799,12 +1435,30 @@ SELECT ");
 
         public int ExecuteAffrows() => _insertProvider.ExecuteAffrows();
         public long ExecuteIdentity() => _insertProvider.ExecuteIdentity();
+        public long ExecuteIdentity(string identityColumn)
+        {
+            if (string.IsNullOrEmpty(identityColumn))
+                throw new Exception(CoreErrorStrings.Cannot_Be_NULL_Name(nameof(identityColumn)));
+            if (_insertProvider._table.ColumnsByCs.TryGetValue(identityColumn, out var col) == false)
+                throw new Exception(CoreErrorStrings.GetPrimarys_ParameterError_IsNotDictKey(identityColumn).Replace(nameof(ExecuteIdentity), ""));
+            col.Attribute.IsIdentity = true;
+            return _insertProvider.ExecuteIdentity();
+        }
         public List<Dictionary<string, object>> ExecuteInserted() => _insertProvider.ExecuteInserted();
 
 #if net40
 #else
         public Task<int> ExecuteAffrowsAsync(CancellationToken cancellationToken = default) => _insertProvider.ExecuteAffrowsAsync(cancellationToken);
         public Task<long> ExecuteIdentityAsync(CancellationToken cancellationToken = default) => _insertProvider.ExecuteIdentityAsync(cancellationToken);
+        public Task<long> ExecuteIdentityAsync(string identityColumn, CancellationToken cancellationToken = default)
+        {
+            if (string.IsNullOrEmpty(identityColumn))
+                throw new Exception(CoreErrorStrings.Cannot_Be_NULL_Name(nameof(identityColumn)));
+            if (_insertProvider._table.ColumnsByCs.TryGetValue(identityColumn, out var col) == false)
+                throw new Exception(CoreErrorStrings.GetPrimarys_ParameterError_IsNotDictKey(identityColumn).Replace(nameof(ExecuteIdentity), ""));
+            col.Attribute.IsIdentity = true;
+            return _insertProvider.ExecuteIdentityAsync(cancellationToken);
+        }
         public Task<List<Dictionary<string, object>>> ExecuteInsertedAsync(CancellationToken cancellationToken = default) => _insertProvider.ExecuteInsertedAsync(cancellationToken);
 #endif
 
@@ -844,6 +1498,19 @@ SELECT ");
             _updateProvider._tempPrimarys = GetPrimarys(_updateProvider._table, primarys);
             return this;
         }
+        /// <summary>
+        /// 原生sql语法条件，Where("col = @xxx", new { xxx = 1 })<para></para>
+        /// 提示：parms 参数还可以传 Dictionary&lt;string, object&gt;
+        /// </summary>
+        /// <param name="sql">sql语法条件</param>
+        /// <param name="parms">参数</param>
+        /// <returns></returns>
+        public UpdateDictImpl Where(string sql, object parms = null)
+        {
+            _updateProvider.Where(sql, parms);
+            return this;
+        }
+
         public static ColumnInfo[] GetPrimarys(TableInfo table, params string[] primarys)
         {
             if (primarys?.Any() != true) throw new ArgumentException(nameof(primarys));
@@ -851,18 +1518,40 @@ SELECT ");
             foreach (var primary in primarys)
             {
                 if (table.ColumnsByCs.TryGetValue(string.Concat(primary), out var col)) pks.Add(col);
-                else throw new Exception($"GetPrimarys 传递的参数 \"{primary}\" 不正确，它不属于字典数据的键名");
+                else throw new Exception(CoreErrorStrings.GetPrimarys_ParameterError_IsNotDictKey(primary));
             }
             return pks.ToArray();
         }
-        public static void SetTablePrimary(TableInfo table, params string[] primarys)
+
+        public static void SetTablePrimary(TableInfo table, bool isIdenity, params string[] primarys)
         {
+            var isFirst = true;
             foreach (var primary in primarys)
             {
-                if (table.ColumnsByCs.TryGetValue(string.Concat(primary), out var col)) col.Attribute.IsPrimary = true;
-                else throw new Exception($"GetPrimarys 传递的参数 \"{primary}\" 不正确，它不属于字典数据的键名");
+                if (table.ColumnsByCs.TryGetValue(string.Concat(primary), out var col))
+                {
+                    col.Attribute.IsPrimary = true;
+                    if (isFirst && isIdenity)
+                    {
+                        isFirst = false;
+                        col.Attribute.IsIdentity = true;
+                    }
+                }
+                else throw new Exception(CoreErrorStrings.GetPrimarys_ParameterError_IsNotDictKey(primary));
             }
             table.Primarys = table.Columns.Where(a => a.Value.Attribute.IsPrimary).Select(a => a.Value).ToArray();
+        }
+        public UpdateDictImpl IsVersion(string version)
+        {
+            if (_updateProvider._table.ColumnsByCs.TryGetValue(version, out var col) == false)
+                throw new Exception(CoreErrorStrings.GetPrimarys_ParameterError_IsNotDictKey(version).Replace(nameof(GetPrimarys), ""));
+            //if (col.Attribute.MapType.IsNullableType() ||
+            //    col.Attribute.MapType.IsNumberType() == false && !new[] { typeof(byte[]), typeof(string) }.Contains(col.Attribute.MapType))
+            //    throw new Exception(CoreErrorStrings.Properties_AsRowLock_Must_Numeric_Byte(col.CsName));
+            col.Attribute.IsVersion = true;
+            _updateProvider._table.VersionColumn = col;
+            _updateProvider._versionColumn = col;
+            return this;
         }
 
         public UpdateDictImpl AsTable(string tableName)
@@ -929,13 +1618,26 @@ SELECT ");
 
         public InsertOrUpdateDictImpl WherePrimary(params string[] primarys)
         {
-            UpdateDictImpl.SetTablePrimary(_insertOrUpdateProvider._table, primarys);
+            UpdateDictImpl.SetTablePrimary(_insertOrUpdateProvider._table, false, primarys);
+            _insertOrUpdateProvider._tempPrimarys = _insertOrUpdateProvider._table.Primarys;
+            return this;
+        }
+        public InsertOrUpdateDictImpl WhereIdentityPrimary(params string[] primarys)
+        {
+            UpdateDictImpl.SetTablePrimary(_insertOrUpdateProvider._table, true, primarys);
+            _insertOrUpdateProvider._tempPrimarys = _insertOrUpdateProvider._table.Primarys;
             return this;
         }
 
         public InsertOrUpdateDictImpl AsTable(string tableName)
         {
             _insertOrUpdateProvider.AsTable(tableName);
+            return this;
+        }
+
+        public InsertOrUpdateDictImpl BatchOptions(int rowsLimit, bool autoTransaction = true)
+        {
+            _insertOrUpdateProvider.BatchOptions(rowsLimit, autoTransaction);
             return this;
         }
 
@@ -986,6 +1688,19 @@ SELECT ");
             return this;
         }
 
+        /// <summary>
+        /// 原生sql语法条件，Where("col = @xxx", new { xxx = 1 })<para></para>
+        /// 提示：parms 参数还可以传 Dictionary&lt;string, object&gt;
+        /// </summary>
+        /// <param name="sql">sql语法条件</param>
+        /// <param name="parms">参数</param>
+        /// <returns></returns>
+        public DeleteDictImpl Where(string sql, object parms = null)
+        {
+            _deleteProvider.Where(sql, parms);
+            return this;
+        }
+
         public DeleteDictImpl CommandTimeout(int timeout)
         {
             _deleteProvider.CommandTimeout(timeout);
@@ -1017,4 +1732,63 @@ SELECT ");
     #endregion
 
     #endregion
+
+    #region Ado.QuerySingle(() => new { DateTime.Now })
+    public static T1 QuerySingle<T1>(this IAdo ado, Expression<Func<T1>> selector)
+    {
+        var nt = SelectNoTable((ado as AdoProvider)?._util._orm, selector);
+        return nt.Item1.ToListMrPrivate<T1>(nt.Item3, nt.Item2, null).FirstOrDefault();
+    }
+#if net40
+#else
+    async public static Task<T1> QuerySingleAsync<T1>(this IAdo ado, Expression<Func<T1>> selector, CancellationToken cancellationToken = default)
+    {
+        var nt = SelectNoTable((ado as AdoProvider)?._util._orm, selector);
+        var result = await nt.Item1.ToListMrPrivateAsync<T1>(nt.Item3, nt.Item2, null, cancellationToken);
+        return result.FirstOrDefault();
+    }
+#endif
+    static NativeTuple<Select1Provider<object>, ReadAnonymousTypeAfInfo, string> SelectNoTable(IFreeSql fsql, Expression selector)
+    {
+        var query = fsql.Select<object>() as Select1Provider<object>;
+        var af = query.GetExpressionField(selector);
+        var sql = "";
+        switch (fsql.Ado.DataType)
+        {
+            case DataType.Oracle:
+            case DataType.OdbcOracle:
+            case DataType.CustomOracle:
+            case DataType.GBase:
+                sql = $" SELECT {af.field} FROM dual";
+                break;
+            case DataType.Firebird:
+                sql = $" SELECT FIRST 1 {af.field} FROM rdb$database";
+                break;
+            default:
+                sql = $" SELECT {af.field}";
+                break;
+        }
+        return NativeTuple.Create(query, af, sql);
+    }
+    #endregion
+
+}
+
+[Flags]
+public enum SqlServerLock
+{
+    NoLock = 1,
+    HoldLock = 2,
+    UpdLock = 4,
+    RowLock = 8,
+    ReadCommitted = 16,
+    ReadPast = 32,
+    ReadUnCommitted = 64,
+    RepeaTableRead = 256,
+    PagLock = 512,
+    Serializable = 1024,
+    TabLock = 2048,
+    TabLockX = 4096,
+    XLock = 8192,
+    NoWait = 16384
 }

@@ -123,7 +123,7 @@ namespace FreeSql.Internal.Model
         NotAny,
 
         /// <summary>
-        /// 自定义解析，此时 Field 为反射信息，Value 为静态方法的参数(string)<para></para>
+        /// 自定义解析，此时 Field 为反射信息，Value 为静态方法的参数(string/Expression)<para></para>
         /// 示范：{ Operator: "Custom", Field: "RawSql webapp1.DynamicFilterCustom,webapp1", Value: "(id,name) in ((1,'k'),(2,'m'))" }<para></para>
         /// 注意：使用者自己承担【注入风险】<para></para>
         /// 静态方法定义示范：<para></para>
@@ -132,7 +132,7 @@ namespace FreeSql.Internal.Model
         /// public class DynamicFilterCustom<para></para>
         /// {<para></para>
         /// [DynamicFilterCustom]<para></para>
-        /// public static string RawSql(string value) => value;<para></para>
+        /// public static string RawSql(object sender, string value) => value;<para></para>
         /// }<para></para>
         /// }<para></para>
         /// </summary>

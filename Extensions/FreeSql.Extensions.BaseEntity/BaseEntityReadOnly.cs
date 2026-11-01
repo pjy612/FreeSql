@@ -24,7 +24,7 @@ namespace FreeSql
         static Func<IFreeSql> _resoleOrm;
         internal static Func<IUnitOfWork> _resolveUow;
 
-        public static IFreeSql Orm => _resoleOrm?.Invoke() ?? throw new Exception("BaseEntity.Initialization 初始化错误，获取到 IFreeSql 是 null");
+        public static IFreeSql Orm => _resoleOrm?.Invoke() ?? throw new Exception(CoreErrorStrings.S_BaseEntity_Initialization_Error);
 
         public static void Initialization(IFreeSql fsql, Func<IUnitOfWork> resolveUow) => Initialization(() => fsql, resolveUow);
         public static void Initialization(Func<IFreeSql> resoleOrm, Func<IUnitOfWork> resolveUow)
@@ -140,6 +140,7 @@ namespace FreeSql
                         if (itemType == typeof(object)) return;
                         if (itemType.FullName.Contains("FreeSqlLazyEntity__")) itemType = itemType.BaseType;
                         if (Orm.CodeFirst.GetTableByEntity(itemType)?.Primarys.Any() != true) return;
+                        if (itemType.GetConstructor(Type.EmptyTypes) == null) return;
                         if (item is BaseEntity<TEntity> == false) return;
                     }
 

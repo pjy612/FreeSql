@@ -20,6 +20,7 @@ namespace FreeSql.Internal.CommonProvider
         public CommonUtils _commonUtils;
         public CommonExpression _commonExpression;
         public Dictionary<string, bool> _ignore = new Dictionary<string, bool>(StringComparer.CurrentCultureIgnoreCase);
+        public Dictionary<string, bool> _ignoreInsertValueSql = new Dictionary<string, bool>(StringComparer.CurrentCultureIgnoreCase);
         public Dictionary<string, bool> _auditValueChangedDict = new Dictionary<string, bool>(StringComparer.CurrentCultureIgnoreCase);
         public TableInfo _table;
         public Func<string, string> _tableRule;
@@ -31,6 +32,7 @@ namespace FreeSql.Internal.CommonProvider
         public DbTransaction _transaction;
         public DbConnection _connection;
         public int _commandTimeout = 0;
+        public bool _isAutoSyncStructure;
     }
 
     public abstract partial class InsertProvider<T1> : InsertProvider, IInsert<T1> where T1 : class
@@ -46,7 +48,8 @@ namespace FreeSql.Internal.CommonProvider
             _commonExpression = commonExpression;
             _table = _commonUtils.GetTableByEntity(typeof(T1));
             _noneParameter = _orm.CodeFirst.IsNoneCommandParameter;
-            if (_orm.CodeFirst.IsAutoSyncStructure && typeof(T1) != typeof(object)) _orm.CodeFirst.SyncStructure<T1>();
+            _isAutoSyncStructure = _orm.CodeFirst.IsAutoSyncStructure;
+            if (_isAutoSyncStructure && typeof(T1) != typeof(object)) _orm.CodeFirst.SyncStructure<T1>();
             IgnoreCanInsert();
             _sourceOld = _source;
         }
@@ -70,6 +73,7 @@ namespace FreeSql.Internal.CommonProvider
             _source.Clear();
             _sourceOld = _source;
             _ignore.Clear();
+            _ignoreInsertValueSql.Clear();
             _auditValueChangedDict.Clear();
             _params = null;
             IgnoreCanInsert();
@@ -78,7 +82,7 @@ namespace FreeSql.Internal.CommonProvider
         public IInsert<T1> WithTransaction(DbTransaction transaction)
         {
             _transaction = transaction;
-            _connection = _transaction?.Connection;
+            if (transaction != null) _connection = transaction.Connection;
             return this;
         }
         public IInsert<T1> WithConnection(DbConnection connection)
@@ -133,7 +137,7 @@ namespace FreeSql.Internal.CommonProvider
         {
             if (source != null)
             {
-                UpdateProvider<T1>.GetDictionaryTableInfo(source.FirstOrDefault(), _orm, ref _table);
+                UpdateProvider<T1>.GetDictionaryTableInfo(source, _orm, ref _table);
                 AuditDataValue(this, source, _orm, _table, _auditValueChangedDict);
                 _source.AddRange(source);
             }
@@ -144,10 +148,9 @@ namespace FreeSql.Internal.CommonProvider
             if (source != null)
             {
                 source = source.Where(a => a != null).ToList();
-                UpdateProvider<T1>.GetDictionaryTableInfo(source.FirstOrDefault(), _orm, ref _table);
+                UpdateProvider<T1>.GetDictionaryTableInfo(source, _orm, ref _table);
                 AuditDataValue(this, source, _orm, _table, _auditValueChangedDict);
                 _source.AddRange(source);
-
             }
             return this;
         }
@@ -161,13 +164,13 @@ namespace FreeSql.Internal.CommonProvider
         {
             if (data == null || table == null) return;
             if (typeof(T1) == typeof(object) && new[] { table.Type, table.TypeLazy }.Contains(data.GetType()) == false)
-                throw new Exception($"操作的数据类型({data.GetType().DisplayCsharp()}) 与 AsType({table.Type.DisplayCsharp()}) 不一致，请检查。");
+                throw new Exception(CoreErrorStrings.DataType_AsType_Inconsistent(data.GetType().DisplayCsharp(), table.Type.DisplayCsharp()));
             foreach (var col in table.Columns.Values)
             {
                 object val = col.GetValue(data);
                 if (orm.Aop.AuditValueHandler != null)
                 {
-                    var auditArgs = new Aop.AuditValueEventArgs(Aop.AuditValueType.Insert, col, table.Properties.TryGetValue(col.CsName, out var tryprop) ? tryprop : null, val);
+                    var auditArgs = new Aop.AuditValueEventArgs(Aop.AuditValueType.Insert, col, table.Properties.TryGetValue(col.CsName, out var tryprop) ? tryprop : null, val, data);
                     orm.Aop.AuditValueHandler(sender, auditArgs);
                     if (auditArgs.ValueIsChanged)
                     {
@@ -175,6 +178,7 @@ namespace FreeSql.Internal.CommonProvider
                         if (changedDict != null && changedDict.ContainsKey(col.Attribute.Name) == false)
                             changedDict.Add(col.Attribute.Name, true);
                     }
+                    if (auditArgs.ObjectAuditBreak) break;
                 }
                 if (col.Attribute.IsPrimary)
                 {
@@ -188,10 +192,22 @@ namespace FreeSql.Internal.CommonProvider
                             col.SetValue(data, val = FreeUtil.NewMongodbId());
                     }
                 }
+                if (col.Attribute.IsVersion)
+                {
+                    if (col.Attribute.MapType == typeof(byte[]))
+                    {
+                        if (val == null || (val is byte[] bytes && bytes.Length == 0))
+                            col.SetValue(data, val = Utils.GuidToBytes(Guid.NewGuid()));
+                    }
+                    else if (col.Attribute.MapType == typeof(string))
+                    {
+                        var verval = col.GetDbValue(data) as string;
+                        if (string.IsNullOrWhiteSpace(verval))
+                            col.SetValue(data, val = Guid.NewGuid().ToString());
+                    }
+                }
                 if (val == null && col.Attribute.MapType == typeof(string) && col.Attribute.IsNullable == false)
                     col.SetValue(data, val = "");
-                if (col.Attribute.MapType == typeof(byte[]) && (val == null || (val is byte[] bytes && bytes.Length == 0)) && col.Attribute.IsVersion)
-                    col.SetValue(data, val = Utils.GuidToBytes(Guid.NewGuid()));
             }
         }
 
@@ -281,7 +297,7 @@ namespace FreeSql.Internal.CommonProvider
                 }
                 else
                 {
-                    if (_orm.Ado.MasterPool == null) throw new Exception("Ado.MasterPool 值为 null，该操作无法自启用事务，请显式传递【事务对象】解决");
+                    if (_orm.Ado.MasterPool == null) throw new Exception(CoreErrorStrings.MasterPool_IsNull_UseTransaction);
                     using (var conn = _orm.Ado.MasterPool.Get())
                     {
                         _transaction = conn.Value.BeginTransaction();
@@ -296,12 +312,12 @@ namespace FreeSql.Internal.CommonProvider
                                 ret += this.RawExecuteAffrows();
                             }
                             _transaction.Commit();
-                            _orm.Aop.TraceAfterHandler?.Invoke(this, new Aop.TraceAfterEventArgs(transBefore, "提交", null));
+                            _orm.Aop.TraceAfterHandler?.Invoke(this, new Aop.TraceAfterEventArgs(transBefore, CoreErrorStrings.Commit, null));
                         }
                         catch (Exception ex)
                         {
                             _transaction.Rollback();
-                            _orm.Aop.TraceAfterHandler?.Invoke(this, new Aop.TraceAfterEventArgs(transBefore, "回滚", ex));
+                            _orm.Aop.TraceAfterHandler?.Invoke(this, new Aop.TraceAfterEventArgs(transBefore, CoreErrorStrings.RollBack, ex));
                             throw;
                         }
                         _transaction = null;
@@ -361,7 +377,7 @@ namespace FreeSql.Internal.CommonProvider
                 }
                 else
                 {
-                    if (_orm.Ado.MasterPool == null) throw new Exception("Ado.MasterPool 值为 null，该操作无法自启用事务，请显式传递【事务对象】解决");
+                    if (_orm.Ado.MasterPool == null) throw new Exception(CoreErrorStrings.MasterPool_IsNull_UseTransaction);
                     using (var conn = _orm.Ado.MasterPool.Get())
                     {
                         _transaction = conn.Value.BeginTransaction();
@@ -377,12 +393,12 @@ namespace FreeSql.Internal.CommonProvider
                                 else ret = this.RawExecuteIdentity();
                             }
                             _transaction.Commit();
-                            _orm.Aop.TraceAfterHandler?.Invoke(this, new Aop.TraceAfterEventArgs(transBefore, "提交", null));
+                            _orm.Aop.TraceAfterHandler?.Invoke(this, new Aop.TraceAfterEventArgs(transBefore, CoreErrorStrings.Commit, null));
                         }
                         catch (Exception ex)
                         {
                             _transaction.Rollback();
-                            _orm.Aop.TraceAfterHandler?.Invoke(this, new Aop.TraceAfterEventArgs(transBefore, "回滚", ex));
+                            _orm.Aop.TraceAfterHandler?.Invoke(this, new Aop.TraceAfterEventArgs(transBefore, CoreErrorStrings.RollBack, ex));
                             throw;
                         }
                         _transaction = null;
@@ -415,7 +431,7 @@ namespace FreeSql.Internal.CommonProvider
             if (ss.Length == 1)
             {
                 _batchProgress?.Invoke(new BatchProgressStatus<T1>(_source, 1, 1));
-                ret = this.RawExecuteInserted();
+                ret = this.InternalExecuteInserted();
                 ClearData();
                 return ret;
             }
@@ -436,12 +452,12 @@ namespace FreeSql.Internal.CommonProvider
                     {
                         _source = ss[a];
                         _batchProgress?.Invoke(new BatchProgressStatus<T1>(_source, a + 1, ss.Length));
-                        ret.AddRange(this.RawExecuteInserted());
+                        ret.AddRange(this.InternalExecuteInserted());
                     }
                 }
                 else
                 {
-                    if (_orm.Ado.MasterPool == null) throw new Exception("Ado.MasterPool 值为 null，该操作无法自启用事务，请显式传递【事务对象】解决");
+                    if (_orm.Ado.MasterPool == null) throw new Exception(CoreErrorStrings.MasterPool_IsNull_UseTransaction);
                     using (var conn = _orm.Ado.MasterPool.Get())
                     {
                         _transaction = conn.Value.BeginTransaction();
@@ -453,15 +469,15 @@ namespace FreeSql.Internal.CommonProvider
                             {
                                 _source = ss[a];
                                 _batchProgress?.Invoke(new BatchProgressStatus<T1>(_source, a + 1, ss.Length));
-                                ret.AddRange(this.RawExecuteInserted());
+                                ret.AddRange(this.InternalExecuteInserted());
                             }
                             _transaction.Commit();
-                            _orm.Aop.TraceAfterHandler?.Invoke(this, new Aop.TraceAfterEventArgs(transBefore, "提交", null));
+                            _orm.Aop.TraceAfterHandler?.Invoke(this, new Aop.TraceAfterEventArgs(transBefore, CoreErrorStrings.Commit, null));
                         }
                         catch (Exception ex)
                         {
                             _transaction.Rollback();
-                            _orm.Aop.TraceAfterHandler?.Invoke(this, new Aop.TraceAfterEventArgs(transBefore, "回滚", ex));
+                            _orm.Aop.TraceAfterHandler?.Invoke(this, new Aop.TraceAfterEventArgs(transBefore, CoreErrorStrings.RollBack, ex));
                             throw;
                         }
                         _transaction = null;
@@ -509,13 +525,20 @@ namespace FreeSql.Internal.CommonProvider
 
         protected abstract long RawExecuteIdentity();
         protected abstract List<T1> RawExecuteInserted();
+        private List<T1> InternalExecuteInserted()
+        {
+            var ret = RawExecuteInserted();
+            if (_table.TypeLazySetOrm != null) ret.ForEach(item => _table.TypeLazySetOrm.Invoke(item, new object[] { _orm }));
+            return ret;
+        }
 
         public abstract int ExecuteAffrows();
         public abstract long ExecuteIdentity();
         public abstract List<T1> ExecuteInserted();
 
-        public IInsert<T1> IgnoreColumns(Expression<Func<T1, object>> columns) => IgnoreColumns(_commonExpression.ExpressionSelectColumns_MemberAccess_New_NewArrayInit(null, columns?.Body, false, null));
-        public IInsert<T1> InsertColumns(Expression<Func<T1, object>> columns) => InsertColumns(_commonExpression.ExpressionSelectColumns_MemberAccess_New_NewArrayInit(null, columns?.Body, false, null));
+        public IInsert<T1> IgnoreColumns(Expression<Func<T1, object>> columns) => IgnoreColumns(_commonExpression.ExpressionSelectColumns_MemberAccess_New_NewArrayInit(null, null, columns?.Body, false, null));
+        public IInsert<T1> InsertColumns(Expression<Func<T1, object>> columns) => InsertColumns(_commonExpression.ExpressionSelectColumns_MemberAccess_New_NewArrayInit(null, null, columns?.Body, false, null));
+        public IInsert<T1> IgnoreInsertValueSql(Expression<Func<T1, object>> columns) => IgnoreInsertValueSql(_commonExpression.ExpressionSelectColumns_MemberAccess_New_NewArrayInit(null, null, columns?.Body, false, null));
 
         public IInsert<T1> IgnoreColumns(string[] columns)
         {
@@ -535,11 +558,20 @@ namespace FreeSql.Internal.CommonProvider
                     _ignore.Add(col.Attribute.Name, true);
             return this;
         }
+        public IInsert<T1> IgnoreInsertValueSql(string[] columns)
+        {
+            var cols = columns.Distinct().ToDictionary(a => a);
+            _ignoreInsertValueSql.Clear();
+            foreach (var col in _table.Columns.Values)
+                if (cols.ContainsKey(col.Attribute.Name) == true || cols.ContainsKey(col.CsName) == true)
+                    _ignoreInsertValueSql.Add(col.Attribute.Name, true);
+            return this;
+        }
 
         protected string TableRuleInvoke()
         {
+            if (_tableRule == null && _table.AsTableImpl == null) return _commonUtils.GetEntityTableAopName(_table, true);
             var tbname = _table?.DbName ?? "";
-            if (_tableRule == null && _table.AsTableImpl == null) return tbname;
             string newname = null;
             if (_table.AsTableImpl != null)
             {
@@ -548,15 +580,15 @@ namespace FreeSql.Internal.CommonProvider
                 else if (_tableRule == null)
                     newname = _table.AsTableImpl.GetTableNameByColumnValue(DateTime.Now);
                 else
-                    newname = _tableRule(_table.DbName);
+                    newname = _tableRule(tbname);
             }
             else
-                newname = _tableRule(_table.DbName);
+                newname = _tableRule(tbname);
             if (newname == tbname) return tbname;
             if (string.IsNullOrEmpty(newname)) return tbname;
             if (_orm.CodeFirst.IsSyncStructureToLower) newname = newname.ToLower();
             if (_orm.CodeFirst.IsSyncStructureToUpper) newname = newname.ToUpper();
-            if (_orm.CodeFirst.IsAutoSyncStructure) _orm.CodeFirst.SyncStructure(_table?.Type, newname);
+            if (_isAutoSyncStructure) _orm.CodeFirst.SyncStructure(_table?.Type, newname);
             return newname;
         }
         public IInsert<T1> AsTable(Func<string, string> tableRule)
@@ -571,22 +603,22 @@ namespace FreeSql.Internal.CommonProvider
         }
         public IInsert<T1> AsType(Type entityType)
         {
-            if (entityType == typeof(object)) throw new Exception("IInsert.AsType 参数不支持指定为 object");
+            if (entityType == typeof(object)) throw new Exception(CoreErrorStrings.TypeAsType_NotSupport_Object("IInsert"));
             if (entityType == typeof(T1)) return this;
             if (entityType == _table.Type) return this;
             var newtb = _commonUtils.GetTableByEntity(entityType);
-            _table = newtb ?? throw new Exception("IInsert.AsType 参数错误，请传入正确的实体类型");
-            if (_orm.CodeFirst.IsAutoSyncStructure) _orm.CodeFirst.SyncStructure(entityType);
+            _table = newtb ?? throw new Exception(CoreErrorStrings.Type_AsType_Parameter_Error("IInsert"));
+            if (_isAutoSyncStructure) _orm.CodeFirst.SyncStructure(entityType);
             IgnoreCanInsert();
             return this;
         }
 
         public virtual string ToSql() => ToSqlValuesOrSelectUnionAllExtension103(true, null, null, false);
 
-        public string ToSqlValuesOrSelectUnionAll(bool isValues = true) => ToSqlValuesOrSelectUnionAllExtension103(isValues, null, null, false);
+        public string ToSqlValuesOrSelectUnionAll(bool isValues = true, List<string> ignoreColumn = null) => ToSqlValuesOrSelectUnionAllExtension103(isValues, null, null, false, ignoreColumn);
         public string ToSqlValuesOrSelectUnionAllExtension101(bool isValues, Action<object, int, StringBuilder> onrow) => ToSqlValuesOrSelectUnionAllExtension103(isValues, null, onrow, false);
         public string ToSqlValuesOrSelectUnionAllExtension102(bool isValues, Action<object, int, StringBuilder> onrowPre, Action<object, int, StringBuilder> onrow) => ToSqlValuesOrSelectUnionAllExtension103(isValues, onrowPre, onrow, false);
-        string ToSqlValuesOrSelectUnionAllExtension103(bool isValues, Action<object, int, StringBuilder> onrowPre, Action<object, int, StringBuilder> onrow, bool isAsTableSplited)
+        string ToSqlValuesOrSelectUnionAllExtension103(bool isValues, Action<object, int, StringBuilder> onrowPre, Action<object, int, StringBuilder> onrow, bool isAsTableSplited, List<string> ignoreColumn = null)
         {
             if (_source == null || _source.Any() == false) return null;
             var sb = new StringBuilder();
@@ -605,7 +637,7 @@ namespace FreeSql.Internal.CommonProvider
                     foreach (var item in atarr)
                     {
                         _source = item.ToList();
-                        sb.Append(ToSqlValuesOrSelectUnionAllExtension103(isValues, onrowPre, onrow, true)).Append("\r\n\r\n;\r\n\r\n");
+                        sb.Append(ToSqlValuesOrSelectUnionAllExtension103(isValues, onrowPre, onrow, true, ignoreColumn)).Append("\r\n\r\n;\r\n\r\n");
                     }
                     _source = oldSource;
                     if (sb.Length > 0) sb.Remove(sb.Length - 9, 9);
@@ -617,6 +649,8 @@ namespace FreeSql.Internal.CommonProvider
             var colidx = 0;
             foreach (var col in _table.Columns.Values)
             {
+                //增加忽略插入的列
+                if (ignoreColumn?.Contains(col.CsName) == true) continue;
                 if (col.Attribute.IsIdentity && _insertIdentity == false && string.IsNullOrEmpty(col.DbInsertValue)) continue;
                 if (col.Attribute.IsIdentity == false && _ignore.ContainsKey(col.Attribute.Name)) continue;
 
@@ -637,11 +671,13 @@ namespace FreeSql.Internal.CommonProvider
                 var colidx2 = 0;
                 foreach (var col in _table.Columns.Values)
                 {
+                    //增加忽略插入的列
+                    if (ignoreColumn?.Contains(col.CsName) == true) continue;
                     if (col.Attribute.IsIdentity && _insertIdentity == false && string.IsNullOrEmpty(col.DbInsertValue)) continue;
                     if (col.Attribute.IsIdentity == false && _ignore.ContainsKey(col.Attribute.Name)) continue;
 
                     if (colidx2 > 0) sb.Append(", ");
-                    if (string.IsNullOrEmpty(col.DbInsertValue) == false)
+                    if (string.IsNullOrEmpty(col.DbInsertValue) == false && _ignoreInsertValueSql.ContainsKey(col.Attribute.Name) == false)
                         sb.Append(col.DbInsertValue);
                     else
                     {
@@ -697,6 +733,7 @@ namespace FreeSql.Internal.CommonProvider
                     {
                         case DataType.SqlServer:
                         case DataType.OdbcSqlServer:
+                        case DataType.CustomSqlServer:
                             if (val?.Equals(DateTime.MinValue) == true) val = new DateTime(1970, 1, 1);
                             break;
                     }

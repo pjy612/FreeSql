@@ -1,13 +1,14 @@
 ﻿using FreeSql.Extensions.EntityUtil;
 using FreeSql.Internal.Model;
+using FreeSql.Internal.ObjectPool;
 using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Data.Common;
 using System.Linq;
 using System.Linq.Expressions;
-using System.Reflection;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace FreeSql.Internal.CommonProvider
@@ -21,13 +22,15 @@ namespace FreeSql.Internal.CommonProvider
         public Dictionary<string, bool> _auditValueChangedDict = new Dictionary<string, bool>(StringComparer.CurrentCultureIgnoreCase);
         public TableInfo _table;
         public ColumnInfo[] _tempPrimarys;
+        public ColumnInfo _versionColumn;
+        public bool _ignoreVersion = false;
         public Func<string, string> _tableRule;
         public StringBuilder _where = new StringBuilder();
         public List<GlobalFilter.Item> _whereGlobalFilter;
         public StringBuilder _set = new StringBuilder();
         public StringBuilder _setIncr = new StringBuilder();
-        public List<DbParameter> _params = new List<DbParameter>();
-        public List<DbParameter> _paramsSource = new List<DbParameter>();
+        public List<DbParameter> _params = new List<DbParameter>(); //已经固定的
+        public List<DbParameter> _paramsSource = new List<DbParameter>(); //每次ToSql重新生成的
         public bool _noneParameter;
         public int _batchRowsLimit, _batchParameterLimit;
         public bool _batchAutoTransaction = true;
@@ -35,7 +38,131 @@ namespace FreeSql.Internal.CommonProvider
         public DbConnection _connection;
         public int _commandTimeout = 0;
         public Action<StringBuilder> _interceptSql;
-        public byte[] _updateVersionValue;
+        public string _tableAlias;
+        public object _updateVersionValue;
+        public bool _isAutoSyncStructure;
+
+
+        public static int ExecuteBulkUpdate<T1>(UpdateProvider<T1> update, NativeTuple<string, string, string, string, string[]> state, Action<IInsert<T1>> funcBulkCopy) where T1 : class =>
+            ExecuteBulkCommand(update._source, update._tempPrimarys, update._orm, update._connection, update._transaction, update._table, state, funcBulkCopy);
+        public static int ExecuteBulkUpsert<T1>(InsertOrUpdateProvider<T1> upsert, NativeTuple<string, string, string, string, string[]> state, Action<IInsert<T1>> funcBulkCopy) where T1 : class =>
+            ExecuteBulkCommand(upsert._source, upsert._tempPrimarys, upsert._orm, upsert._connection, upsert._transaction, upsert._table, state, funcBulkCopy);
+
+        public static int ExecuteBulkCommand<T1>(List<T1> _source, ColumnInfo[] _tempPrimarys, IFreeSql _orm, DbConnection _connection, DbTransaction _transaction, TableInfo _table,
+            NativeTuple<string, string, string, string, string[]> state, Action<IInsert<T1>> funcBulkCopy) where T1 : class
+        {
+            if (_source.Any() != true || _tempPrimarys.Any() == false) return 0;
+            var fsql = _orm;
+            var connection = _connection;
+            var transaction = _transaction;
+
+            Object<DbConnection> poolConn = null;
+            if (connection == null)
+            {
+                poolConn = fsql.Ado.MasterPool.Get();
+                connection = poolConn.Value;
+            }
+            try
+            {
+                var droped = false;
+                fsql.Ado.CommandFluent(state.Item1).WithConnection(connection).WithTransaction(transaction).ExecuteNonQuery();
+                try
+                {
+                    var insert = fsql.Insert<T1>();
+                    (insert as InsertProvider<T1>)._source.AddRange(_source); //不能直接 AppendData，防止触发 Aop.AuditValue
+                    insert
+                        .AsType(_table.Type)
+                        .WithConnection(connection)
+                        .WithTransaction(transaction)
+                        .InsertIdentity()
+                        .InsertColumns(state.Item5)
+                        .AsTable(state.Item4);
+                    (insert as InsertProvider)._isAutoSyncStructure = false;
+                    funcBulkCopy(insert);
+                    switch (fsql.Ado.DataType)
+                    {
+                        case DataType.Oracle:
+                        case DataType.OdbcOracle:
+                        case DataType.CustomOracle:
+                        case DataType.Dameng:
+                            return fsql.Ado.CommandFluent(state.Item2).WithConnection(connection).WithTransaction(transaction).ExecuteNonQuery();
+                    }
+                    var affrows = fsql.Ado.CommandFluent(state.Item2 + ";\r\n" + state.Item3).WithConnection(connection).WithTransaction(transaction).ExecuteNonQuery();
+                    droped = true;
+                    return affrows;
+                }
+                finally
+                {
+                    if (droped == false) fsql.Ado.CommandFluent(state.Item3).WithConnection(connection).WithTransaction(transaction).ExecuteNonQuery();
+                }
+            }
+            finally
+            {
+                poolConn?.Dispose();
+            }
+        }
+#if net40
+#else
+        public static Task<int> ExecuteBulkUpdateAsync<T1>(UpdateProvider<T1> update, NativeTuple<string, string, string, string, string[]> state, Func<IInsert<T1>, Task> funcBulkCopy) where T1 : class =>
+            ExecuteBulkCommandAsync(update._source, update._tempPrimarys, update._orm, update._connection, update._transaction, update._table, state, funcBulkCopy);
+
+        public static Task<int> ExecuteBulkUpsertAsync<T1>(InsertOrUpdateProvider<T1> upsert, NativeTuple<string, string, string, string, string[]> state, Func<IInsert<T1>, Task> funcBulkCopy) where T1 : class =>
+            ExecuteBulkCommandAsync(upsert._source, upsert._tempPrimarys, upsert._orm, upsert._connection, upsert._transaction, upsert._table, state, funcBulkCopy);
+
+        async public static Task<int> ExecuteBulkCommandAsync<T1>(List<T1> _source, ColumnInfo[] _tempPrimarys, IFreeSql _orm, DbConnection _connection, DbTransaction _transaction, TableInfo _table,
+            NativeTuple<string, string, string, string, string[]> state, Func<IInsert<T1>, Task> funcBulkCopy) where T1 : class
+        {
+            if (_source.Any() != true || _tempPrimarys.Any() == false) return 0;
+            var fsql = _orm;
+            var connection = _connection;
+            var transaction = _transaction;
+
+            Object<DbConnection> poolConn = null;
+            if (connection == null)
+            {
+                poolConn = await fsql.Ado.MasterPool.GetAsync();
+                connection = poolConn.Value;
+            }
+            try
+            {
+                var droped = false;
+                await fsql.Ado.CommandFluent(state.Item1).WithConnection(connection).WithTransaction(transaction).ExecuteNonQueryAsync();
+                try
+                {
+                    var insert = fsql.Insert<T1>();
+                    (insert as InsertProvider<T1>)._source.AddRange(_source); //不能直接 AppendData，防止触发 Aop.AuditValue
+                    insert
+                        .AsType(_table.Type)
+                        .WithConnection(connection)
+                        .WithTransaction(transaction)
+                        .InsertIdentity()
+                        .InsertColumns(state.Item5)
+                        .AsTable(state.Item4);
+                    (insert as InsertProvider)._isAutoSyncStructure = false;
+                    await funcBulkCopy(insert);
+                    switch (fsql.Ado.DataType)
+                    {
+                        case DataType.Oracle:
+                        case DataType.OdbcOracle:
+                        case DataType.CustomOracle:
+                        case DataType.Dameng:
+                            return await fsql.Ado.CommandFluent(state.Item2).WithConnection(connection).WithTransaction(transaction).ExecuteNonQueryAsync();
+                    }
+                    var affrows = await fsql.Ado.CommandFluent(state.Item2 + ";\r\n" + state.Item3).WithConnection(connection).WithTransaction(transaction).ExecuteNonQueryAsync();
+                    droped = true;
+                    return affrows;
+                }
+                finally
+                {
+                    if (droped == false) await fsql.Ado.CommandFluent(state.Item3).WithConnection(connection).WithTransaction(transaction).ExecuteNonQueryAsync();
+                }
+            }
+            finally
+            {
+                poolConn?.Dispose();
+            }
+        }
+#endif
     }
 
     public abstract partial class UpdateProvider<T1> : UpdateProvider, IUpdate<T1>
@@ -51,11 +178,13 @@ namespace FreeSql.Internal.CommonProvider
             _commonExpression = commonExpression;
             _table = _commonUtils.GetTableByEntity(typeof(T1));
             _tempPrimarys = _table?.Primarys ?? new ColumnInfo[0];
+            _versionColumn = _table?.VersionColumn;
             _noneParameter = _orm.CodeFirst.IsNoneCommandParameter;
-            this.Where(_commonUtils.WhereObject(_table, "", dywhere));
-            if (_orm.CodeFirst.IsAutoSyncStructure && typeof(T1) != typeof(object)) _orm.CodeFirst.SyncStructure<T1>();
+            _isAutoSyncStructure = _orm.CodeFirst.IsAutoSyncStructure;
+            this.Where(_commonUtils.WhereObject(_table, "", dywhere, _params));
+            if (_isAutoSyncStructure && typeof(T1) != typeof(object)) _orm.CodeFirst.SyncStructure<T1>();
             IgnoreCanUpdate();
-            _whereGlobalFilter = _orm.GlobalFilter.GetFilters();
+            _whereGlobalFilter = _orm.GlobalFilter.GetFilters().Where(l => (l.FilterType & GlobalFilter.FilterType.Update) == GlobalFilter.FilterType.Update).ToList();
             _sourceOld = _source;
         }
 
@@ -83,16 +212,27 @@ namespace FreeSql.Internal.CommonProvider
             _params.Clear();
             _paramsSource.Clear();
             IgnoreCanUpdate();
-            _whereGlobalFilter = _orm.GlobalFilter.GetFilters();
+            _whereGlobalFilter = _orm.GlobalFilter.GetFilters().Where(l => (l.FilterType & GlobalFilter.FilterType.Update) == GlobalFilter.FilterType.Update).ToList();
             _batchProgress = null;
             _interceptSql = null;
-            _updateVersionValue = null;
+            _tableAlias = null;
+            _versionColumn = _table?.VersionColumn;
+            _ignoreVersion = false;
+        }
+
+        public IUpdateJoin<T1, T2> Join<T2>(Expression<Func<T1, T2, bool>> on) where T2 : class => Join<T2>(_orm.Select<T2>(), on);
+        public IUpdateJoin<T1, T2> Join<T2>(ISelect<T2> query, Expression<Func<T1, T2, bool>> on) where T2 : class
+        {
+            var ctor = typeof(UpdateJoinProvider<,>).MakeGenericType(typeof(T1), typeof(T2))
+                .GetConstructor(new[] { typeof(IUpdate<T1>), typeof(ISelect<T2>), typeof(Expression<Func<T1, T2, bool>>) });
+            if (ctor == null) throw new Exception(CoreErrorStrings.Type_Cannot_Access_Constructor("UpdateJoinProvider<>"));
+            return ctor.Invoke(new object[] { this, query, on }) as IUpdateJoin<T1, T2>;
         }
 
         public IUpdate<T1> WithTransaction(DbTransaction transaction)
         {
             _transaction = transaction;
-            _connection = _transaction?.Connection;
+            if (transaction != null) _connection = transaction.Connection;
             return this;
         }
         public IUpdate<T1> WithConnection(DbConnection connection)
@@ -129,16 +269,35 @@ namespace FreeSql.Internal.CommonProvider
 
         protected void ValidateVersionAndThrow(int affrows, string sql, DbParameter[] dbParms)
         {
-            if (_table.VersionColumn != null && _source.Count > 0)
+            if (_versionColumn != null && _source.Count > 0)
             {
                 if (affrows != _source.Count)
-                    throw new DbUpdateVersionException($"记录可能不存在，或者【行级乐观锁】版本过旧，更新数量{_source.Count}，影响的行数{affrows}。", _table, sql, dbParms, affrows, _source.Select(a => (object)a));
+                    throw new DbUpdateVersionException(CoreErrorStrings.DbUpdateVersionException_RowLevelOptimisticLock(_source.Count, affrows), _table, sql, dbParms, affrows, _source.Select(a => (object)a));
                 foreach (var d in _source)
                 {
-                    if (_table.VersionColumn.Attribute.MapType == typeof(byte[]))
-                        _orm.SetEntityValueWithPropertyName(_table.Type, d, _table.VersionColumn.CsName, _updateVersionValue);
+                    if (d is Dictionary<string, object> dict)
+                    {
+                        if (dict.ContainsKey(_versionColumn.CsName))
+                        {
+                            var val = dict[_versionColumn.CsName];
+                            if (val == null) continue;
+                            var valType = val.GetType();
+
+                            if (valType == typeof(byte[]))
+                                dict[_versionColumn.CsName] = _updateVersionValue;
+                            else if (valType == typeof(string))
+                                dict[_versionColumn.CsName] = _updateVersionValue;
+                            else if (int.TryParse(string.Concat(val), out var tryintver))
+                                dict[_versionColumn.CsName] = tryintver + 1;
+                        }
+                        continue;
+                    }
+                    if (_versionColumn.Attribute.MapType == typeof(byte[]))
+                        _orm.SetEntityValueWithPropertyName(_table.Type, d, _versionColumn.CsName, _updateVersionValue);
+                    else if (_versionColumn.Attribute.MapType == typeof(string))
+                        _orm.SetEntityValueWithPropertyName(_table.Type, d, _versionColumn.CsName, _updateVersionValue);
                     else
-                        _orm.SetEntityIncrByWithPropertyName(_table.Type, d, _table.VersionColumn.CsName, 1);
+                        _orm.SetEntityIncrByWithPropertyName(_table.Type, d, _versionColumn.CsName, 1);
                 }
             }
         }
@@ -191,156 +350,97 @@ namespace FreeSql.Internal.CommonProvider
                 ret[a] = _source.GetRange(a * takeMax, Math.Min(takeMax, _source.Count - a * takeMax));
             return ret;
         }
-        protected virtual int SplitExecuteAffrows(int valuesLimit, int parameterLimit)
+        protected virtual void SplitExecute(int valuesLimit, int parameterLimit, string traceName, Action execute)
         {
-            var ss = SplitSource(valuesLimit, parameterLimit);
+			var ss = SplitSource(valuesLimit, parameterLimit);
+			if (ss.Length <= 1)
+			{
+				if (_source?.Any() == true) _batchProgress?.Invoke(new BatchProgressStatus<T1>(_source, 1, 1));
+                execute();
+				ClearData();
+				return;
+			}
+			if (_transaction == null)
+			{
+				var threadTransaction = _orm.Ado.TransactionCurrentThread;
+				if (threadTransaction != null) this.WithTransaction(threadTransaction);
+			}
+
+			var before = new Aop.TraceBeforeEventArgs(traceName, null);
+			_orm.Aop.TraceBeforeHandler?.Invoke(this, before);
+			Exception exception = null;
+			try
+			{
+				if (_transaction != null || _batchAutoTransaction == false)
+				{
+					for (var a = 0; a < ss.Length; a++)
+					{
+						_source = ss[a];
+						_batchProgress?.Invoke(new BatchProgressStatus<T1>(_source, a + 1, ss.Length));
+                        execute();
+					}
+				}
+				else
+				{
+					if (_orm.Ado.MasterPool == null) throw new Exception(CoreErrorStrings.MasterPool_IsNull_UseTransaction);
+					using (var conn = _orm.Ado.MasterPool.Get())
+					{
+						_transaction = conn.Value.BeginTransaction();
+						var transBefore = new Aop.TraceBeforeEventArgs("BeginTransaction", null);
+						_orm.Aop.TraceBeforeHandler?.Invoke(this, transBefore);
+						try
+						{
+							for (var a = 0; a < ss.Length; a++)
+							{
+								_source = ss[a];
+								_batchProgress?.Invoke(new BatchProgressStatus<T1>(_source, a + 1, ss.Length));
+								execute();
+							}
+							_transaction.Commit();
+							_orm.Aop.TraceAfterHandler?.Invoke(this, new Aop.TraceAfterEventArgs(transBefore, CoreErrorStrings.Commit, null));
+						}
+						catch (Exception ex)
+						{
+							_transaction.Rollback();
+							_orm.Aop.TraceAfterHandler?.Invoke(this, new Aop.TraceAfterEventArgs(transBefore, CoreErrorStrings.RollBack, ex));
+							throw;
+						}
+						_transaction = null;
+					}
+				}
+			}
+			catch (Exception ex)
+			{
+				exception = ex;
+				throw;
+			}
+			finally
+			{
+				var after = new Aop.TraceAfterEventArgs(before, null, exception);
+				_orm.Aop.TraceAfterHandler?.Invoke(this, after);
+			}
+			ClearData();
+		}
+
+		protected int SplitExecuteAffrows(int valuesLimit, int parameterLimit)
+        {
             var ret = 0;
-            if (ss.Length <= 1)
-            {
-                if (_source?.Any() == true) _batchProgress?.Invoke(new BatchProgressStatus<T1>(_source, 1, 1));
-                ret = this.RawExecuteAffrows();
-                ClearData();
-                return ret;
-            }
-            if (_transaction == null)
-            {
-                var threadTransaction = _orm.Ado.TransactionCurrentThread;
-                if (threadTransaction != null) this.WithTransaction(threadTransaction);
-            }
-
-            var before = new Aop.TraceBeforeEventArgs("SplitExecuteAffrows", null);
-            _orm.Aop.TraceBeforeHandler?.Invoke(this, before);
-            Exception exception = null;
-            try
-            {
-                if (_transaction != null || _batchAutoTransaction == false)
-                {
-                    for (var a = 0; a < ss.Length; a++)
-                    {
-                        _source = ss[a];
-                        _batchProgress?.Invoke(new BatchProgressStatus<T1>(_source, a + 1, ss.Length));
-                        ret += this.RawExecuteAffrows();
-                    }
-                }
-                else
-                {
-                    if (_orm.Ado.MasterPool == null) throw new Exception("Ado.MasterPool 值为 null，该操作无法自启用事务，请显式传递【事务对象】解决");
-                    using (var conn = _orm.Ado.MasterPool.Get())
-                    {
-                        _transaction = conn.Value.BeginTransaction();
-                        var transBefore = new Aop.TraceBeforeEventArgs("BeginTransaction", null);
-                        _orm.Aop.TraceBeforeHandler?.Invoke(this, transBefore);
-                        try
-                        {
-                            for (var a = 0; a < ss.Length; a++)
-                            {
-                                _source = ss[a];
-                                _batchProgress?.Invoke(new BatchProgressStatus<T1>(_source, a + 1, ss.Length));
-                                ret += this.RawExecuteAffrows();
-                            }
-                            _transaction.Commit();
-                            _orm.Aop.TraceAfterHandler?.Invoke(this, new Aop.TraceAfterEventArgs(transBefore, "提交", null));
-                        }
-                        catch (Exception ex)
-                        {
-                            _transaction.Rollback();
-                            _orm.Aop.TraceAfterHandler?.Invoke(this, new Aop.TraceAfterEventArgs(transBefore, "回滚", ex));
-                            throw;
-                        }
-                        _transaction = null;
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                exception = ex;
-                throw;
-            }
-            finally
-            {
-                var after = new Aop.TraceAfterEventArgs(before, null, exception);
-                _orm.Aop.TraceAfterHandler?.Invoke(this, after);
-            }
-            ClearData();
+            SplitExecute(valuesLimit, parameterLimit, "SplitExecuteAffrows", () =>
+                ret += this.RawExecuteAffrows()
+            );
             return ret;
         }
+		protected List<TReturn> SplitExecuteUpdated<TReturn>(int valuesLimit, int parameterLimit, IEnumerable<ColumnInfo> columns)
+		{
+			var ret = new List<TReturn>();
+			SplitExecute(valuesLimit, parameterLimit, "SplitExecuteUpdated", () =>
+				ret.AddRange(this.RawExecuteUpdated<TReturn>(columns ?? _table.ColumnsByPosition))
+			);
+			return ret;
+		}
+		#endregion
 
-        protected virtual List<T1> SplitExecuteUpdated(int valuesLimit, int parameterLimit)
-        {
-            var ss = SplitSource(valuesLimit, parameterLimit);
-            var ret = new List<T1>();
-            if (ss.Length <= 1)
-            {
-                if (_source?.Any() == true) _batchProgress?.Invoke(new BatchProgressStatus<T1>(_source, 1, 1));
-                ret = this.RawExecuteUpdated();
-                ClearData();
-                return ret;
-            }
-            if (_transaction == null)
-            {
-                var threadTransaction = _orm.Ado.TransactionCurrentThread;
-                if (threadTransaction != null) this.WithTransaction(threadTransaction);
-            }
-
-            var before = new Aop.TraceBeforeEventArgs("SplitExecuteUpdated", null);
-            _orm.Aop.TraceBeforeHandler?.Invoke(this, before);
-            Exception exception = null;
-            try
-            {
-                if (_transaction != null || _batchAutoTransaction == false)
-                {
-                    for (var a = 0; a < ss.Length; a++)
-                    {
-                        _source = ss[a];
-                        _batchProgress?.Invoke(new BatchProgressStatus<T1>(_source, a + 1, ss.Length));
-                        ret.AddRange(this.RawExecuteUpdated());
-                    }
-                }
-                else
-                {
-                    if (_orm.Ado.MasterPool == null) throw new Exception("Ado.MasterPool 值为 null，该操作无法自启用事务，请显式传递【事务对象】解决");
-                    using (var conn = _orm.Ado.MasterPool.Get())
-                    {
-                        _transaction = conn.Value.BeginTransaction();
-                        var transBefore = new Aop.TraceBeforeEventArgs("BeginTransaction", null);
-                        _orm.Aop.TraceBeforeHandler?.Invoke(this, transBefore);
-                        try
-                        {
-                            for (var a = 0; a < ss.Length; a++)
-                            {
-                                _source = ss[a];
-                                _batchProgress?.Invoke(new BatchProgressStatus<T1>(_source, a + 1, ss.Length));
-                                ret.AddRange(this.RawExecuteUpdated());
-                            }
-                            _transaction.Commit();
-                            _orm.Aop.TraceAfterHandler?.Invoke(this, new Aop.TraceAfterEventArgs(transBefore, "提交", null));
-                        }
-                        catch (Exception ex)
-                        {
-                            _transaction.Rollback();
-                            _orm.Aop.TraceAfterHandler?.Invoke(this, new Aop.TraceAfterEventArgs(transBefore, "回滚", ex));
-                            throw;
-                        }
-                        _transaction = null;
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                exception = ex;
-                throw;
-            }
-            finally
-            {
-                var after = new Aop.TraceAfterEventArgs(before, null, exception);
-                _orm.Aop.TraceAfterHandler?.Invoke(this, after);
-            }
-            ClearData();
-            return ret;
-        }
-        #endregion
-
-        protected int RawExecuteAffrows()
+		protected int RawExecuteAffrows()
         {
             var affrows = 0;
             DbParameter[] dbParms = null;
@@ -372,13 +472,28 @@ namespace FreeSql.Internal.CommonProvider
             return affrows;
         }
 
-        protected abstract List<T1> RawExecuteUpdated();
+        protected abstract List<TReturn> RawExecuteUpdated<TReturn>(IEnumerable<ColumnInfo> columns);
 
-        public abstract int ExecuteAffrows();
-        public abstract List<T1> ExecuteUpdated();
+		public abstract int ExecuteAffrows();
+		protected abstract List<TReturn> ExecuteUpdated<TReturn>(IEnumerable<ColumnInfo> columns);
 
-        public IUpdate<T1> IgnoreColumns(Expression<Func<T1, object>> columns) => IgnoreColumns(_commonExpression.ExpressionSelectColumns_MemberAccess_New_NewArrayInit(null, columns?.Body, false, null));
-        public IUpdate<T1> UpdateColumns(Expression<Func<T1, object>> columns) => UpdateColumns(_commonExpression.ExpressionSelectColumns_MemberAccess_New_NewArrayInit(null, columns?.Body, false, null));
+        public List<T1> ExecuteUpdated()
+        {
+            var ret = ExecuteUpdated<T1>(_table.Columns.Values);
+            if (_table.TypeLazySetOrm != null) ret.ForEach(item => _table.TypeLazySetOrm.Invoke(item, new object[] { _orm }));
+            return ret;
+        }
+        public List<TReturn> ExecuteUpdated<TReturn>(Expression<Func<T1, TReturn>> returnColumns)
+		{
+            var cols = _commonExpression.ExpressionSelectColumns_MemberAccess_New_NewArrayInit(null, null, returnColumns?.Body, false, null)
+                .Distinct().Select(a => _table.ColumnsByCs.TryGetValue(a, out var c) ? c : null).Where(a => a != null).ToArray();
+			var ret = ExecuteUpdated<TReturn>(cols);
+            if (_table.TypeLazySetOrm != null) ret.ForEach(item => _table.TypeLazySetOrm.Invoke(item, new object[] { _orm }));
+            return ret;
+        }
+
+		public IUpdate<T1> IgnoreColumns(Expression<Func<T1, object>> columns) => IgnoreColumns(_commonExpression.ExpressionSelectColumns_MemberAccess_New_NewArrayInit(null, null, columns?.Body, false, null));
+        public IUpdate<T1> UpdateColumns(Expression<Func<T1, object>> columns) => UpdateColumns(_commonExpression.ExpressionSelectColumns_MemberAccess_New_NewArrayInit(null, null, columns?.Body, false, null));
 
         public IUpdate<T1> IgnoreColumns(string[] columns)
         {
@@ -410,7 +525,7 @@ namespace FreeSql.Internal.CommonProvider
                 foreach (var col in table.Columns.Values)
                 {
                     object val = col.GetValue(d);
-                    var auditArgs = new Aop.AuditValueEventArgs(Aop.AuditValueType.Update, col, table.Properties.TryGetValue(col.CsName, out var tryprop) ? tryprop : null, val);
+                    var auditArgs = new Aop.AuditValueEventArgs(Aop.AuditValueType.Update, col, table.Properties.TryGetValue(col.CsName, out var tryprop) ? tryprop : null, val, d);
                     orm.Aop.AuditValueHandler(sender, auditArgs);
                     if (auditArgs.ValueIsChanged)
                     {
@@ -418,6 +533,8 @@ namespace FreeSql.Internal.CommonProvider
                         if (changedDict != null && changedDict.ContainsKey(col.Attribute.Name) == false)
                             changedDict.Add(col.Attribute.Name, true);
                     }
+                    if (auditArgs.ObjectAuditBreak) break;
+
                     if (val == null && col.Attribute.MapType == typeof(string) && col.Attribute.IsNullable == false)
                         col.SetValue(d, val = "");
                 }
@@ -428,11 +545,11 @@ namespace FreeSql.Internal.CommonProvider
             if (orm.Aop.AuditValueHandler == null) return;
             if (data == null || table == null) return;
             if (typeof(T1) == typeof(object) && new[] { table.Type, table.TypeLazy }.Contains(data.GetType()) == false)
-                throw new Exception($"操作的数据类型({data.GetType().DisplayCsharp()}) 与 AsType({table.Type.DisplayCsharp()}) 不一致，请检查。");
+                throw new Exception(CoreErrorStrings.DataType_AsType_Inconsistent(data.GetType().DisplayCsharp(), table.Type.DisplayCsharp()));
             foreach (var col in table.Columns.Values)
             {
                 object val = col.GetValue(data);
-                var auditArgs = new Aop.AuditValueEventArgs(Aop.AuditValueType.Update, col, table.Properties.TryGetValue(col.CsName, out var tryprop) ? tryprop : null, val);
+                var auditArgs = new Aop.AuditValueEventArgs(Aop.AuditValueType.Update, col, table.Properties.TryGetValue(col.CsName, out var tryprop) ? tryprop : null, val, data);
                 orm.Aop.AuditValueHandler(sender, auditArgs);
                 if (auditArgs.ValueIsChanged)
                 {
@@ -440,11 +557,40 @@ namespace FreeSql.Internal.CommonProvider
                     if (changedDict != null && changedDict.ContainsKey(col.Attribute.Name) == false)
                         changedDict.Add(col.Attribute.Name, true);
                 }
+                if (auditArgs.ObjectAuditBreak) break;
+
                 if (val == null && col.Attribute.MapType == typeof(string) && col.Attribute.IsNullable == false)
                     col.SetValue(data, val = "");
             }
         }
 
+        public static void GetDictionaryTableInfo(IEnumerable<T1> source, IFreeSql orm, ref TableInfo table)
+        {
+            if (table == null && typeof(T1) == typeof(Dictionary<string, object>) && source is IEnumerable<Dictionary<string, object>> dicType)
+            {
+                var tempDict = new Dictionary<string, object>();
+                var keyCounts = new Dictionary<string, int>();
+                var nullableKeys = new HashSet<string>();
+                var itemCount = 0;
+                foreach (var item in dicType)
+                {
+                    itemCount++;
+                    foreach (string key in item.Keys)
+                    {
+                        keyCounts[key] = keyCounts.TryGetValue(key, out var count) ? count + 1 : 1;
+                        if (item[key] == null) nullableKeys.Add(key);
+                        if (!tempDict.ContainsKey(key)) tempDict[key] = item[key];
+                        else if (!(item[key] is null)) tempDict[key] = item[key];
+                    }
+                }
+                UpdateProvider<Dictionary<string, object>>.GetDictionaryTableInfo(tempDict, orm, ref table);
+                foreach (var col in table.ColumnsByCs.Values)
+                    if (nullableKeys.Contains(col.CsName) || keyCounts[col.CsName] < itemCount)
+                        col.Attribute.IsNullable = true;
+                return;
+            }
+            GetDictionaryTableInfo(source.FirstOrDefault(), orm, ref table);
+        }
         public static void GetDictionaryTableInfo(T1 source, IFreeSql orm, ref TableInfo table)
         {
             if (table == null && typeof(T1) == typeof(Dictionary<string, object>))
@@ -455,12 +601,17 @@ namespace FreeSql.Internal.CommonProvider
                 table.Type = typeof(Dictionary<string, object>);
                 table.CsName = dic.TryGetValue("", out var tryval) ? string.Concat(tryval) : "";
                 table.DbName = table.CsName;
+                if (orm.CodeFirst.IsSyncStructureToLower) table.DbName = table.DbName.ToLower();
+                if (orm.CodeFirst.IsSyncStructureToUpper) table.DbName = table.DbName.ToUpper();
+
                 table.DisableSyncStructure = true;
                 table.IsDictionaryType = true;
                 var colpos = new List<ColumnInfo>();
                 foreach (var kv in dic)
                 {
                     var colName = kv.Key;
+                    if (string.IsNullOrWhiteSpace(colName)) continue;
+                    var colType = kv.Value == null ? typeof(object) : kv.Value.GetType();
                     if (orm.CodeFirst.IsSyncStructureToLower) colName = colName.ToLower();
                     if (orm.CodeFirst.IsSyncStructureToUpper) colName = colName.ToUpper();
                     var col = new ColumnInfo
@@ -470,9 +621,9 @@ namespace FreeSql.Internal.CommonProvider
                         Attribute = new DataAnnotations.ColumnAttribute
                         {
                             Name = colName,
-                            MapType = typeof(object)
+                            MapType = colType
                         },
-                        CsType = typeof(object)
+                        CsType = colType
                     };
                     table.Columns.Add(colName, col);
                     table.ColumnsByCs.Add(kv.Key, col);
@@ -484,23 +635,25 @@ namespace FreeSql.Internal.CommonProvider
         }
 
         public IUpdate<T1> SetSource(T1 source) => this.SetSource(new[] { source });
-        public IUpdate<T1> SetSource(IEnumerable<T1> source, Expression<Func<T1, object>> tempPrimarys = null)
+        public IUpdate<T1> SetSource(IEnumerable<T1> source, Expression<Func<T1, object>> tempPrimarys = null, bool ignoreVersion = false)
         {
             if (source == null || source.Any() == false) return this;
-            GetDictionaryTableInfo(source.FirstOrDefault(), _orm, ref _table);
+            GetDictionaryTableInfo(source, _orm, ref _table);
             AuditDataValue(this, source, _orm, _table, _auditValueChangedDict);
             _source.AddRange(source.Where(a => a != null));
 
             if (tempPrimarys != null)
             {
-                var cols = _commonExpression.ExpressionSelectColumns_MemberAccess_New_NewArrayInit(null, tempPrimarys?.Body, false, null).Distinct().ToDictionary(a => a);
-                _tempPrimarys = cols.Keys.Select(a => _table.ColumnsByCs.TryGetValue(a, out var col) ? col : null).ToArray().Where(a => a != null).ToArray();
+                var cols = _commonExpression.ExpressionSelectColumns_MemberAccess_New_NewArrayInit(null, null, tempPrimarys?.Body, false, null).Distinct().ToDictionary(a => a);
+                _tempPrimarys = cols.Keys.Select(a => _table.Columns.TryGetValue(a, out var col) ? col : null).ToArray().Where(a => a != null).ToArray();
             }
+            _ignoreVersion = ignoreVersion;
+            _versionColumn = _ignoreVersion ? null : _table?.VersionColumn;
             return this;
         }
-        public IUpdate<T1> SetSourceIgnore(T1 source, Func<object, bool> ignore)
+        public IUpdate<T1> SetSourceIgnore(T1 source, Func<object, bool> ignore = null)
         {
-            if (ignore == null) throw new ArgumentNullException(nameof(ignore));
+            if (ignore == null) ignore = val => val == null;
             var columns = _table.Columns.Values
                 .Where(col => ignore(_orm.GetEntityValueWithPropertyName(_table.Type, source, col.CsName)))
                 .Select(col => col.Attribute.Name).ToArray();
@@ -525,9 +678,20 @@ namespace FreeSql.Internal.CommonProvider
         public IUpdate<T1> Set<TMember>(Expression<Func<T1, TMember>> column, TMember value)
         {
             var cols = new List<SelectColumnInfo>();
-            _commonExpression.ExpressionSelectColumn_MemberAccess(null, cols, SelectTableInfoType.From, column?.Body, true, null);
+            _commonExpression.ExpressionSelectColumn_MemberAccess(null, null, cols, SelectTableInfoType.From, column?.Body, true, null);
             if (cols.Count != 1) return this;
             SetPriv(cols.First().Column, value);
+            return this;
+        }
+        public IUpdate<T1> SetByPropertyNameIf(bool condition, string propertyName, object value)=> condition ? SetByPropertyName(propertyName, value) : this;
+        public IUpdate<T1> SetByPropertyName(string propertyName, object value)
+        {
+            var alias = "t_" + Guid.NewGuid().ToString("n").Substring(0, 8);
+            var tempQuery = _orm.Select<object>().AsType(_table.Type).DisableGlobalFilter().As(alias);
+            tempQuery.WhereDynamicFilter(new DynamicFilterInfo { Field = propertyName, Operator = DynamicFilterOperator.Eq, Value = value });
+            var where = (tempQuery as Select0Provider)._where.ToString().Replace(alias + ".", "").Replace("  IS  NULL", " = NULL");
+            if (where.StartsWith(" AND (")) where = where.Substring(6, where.Length - 7);
+            _set.Append(", ").Append(where);
             return this;
         }
         public IUpdate<T1> SetIf<TMember>(bool condition, Expression<Func<T1, TMember>> column, TMember value) => condition ? Set(column, value) : this;
@@ -540,51 +704,86 @@ namespace FreeSql.Internal.CommonProvider
                 body = (body as UnaryExpression)?.Operand;
                 nodeType = body?.NodeType;
             }
+            var isPgsqlStyle = false;
+            switch (_orm.Ado.DataType)
+            {
+                case DataType.PostgreSQL:
+                case DataType.OdbcPostgreSQL:
+                case DataType.CustomPostgreSQL:
+                case DataType.KingbaseES:
+                case DataType.ShenTong:
+                    isPgsqlStyle = true;
+                    break;
+            }
             switch (nodeType)
             {
                 case ExpressionType.Equal:
-                    var equalBinaryExp = body as BinaryExpression;
-                    var eqval = _commonExpression.ExpressionWhereLambdaNoneForeignObject(null, _table, null, body, null, null);
-                    if (eqval.EndsWith("  IS  NULL")) eqval = $"{eqval.Remove(eqval.Length - 10)} = NULL"; //#311
-                    _set.Append(", ").Append(eqval);
-                    return this;
+                    {
+                        var equalBinaryExp = body as BinaryExpression;
+                        if (isPgsqlStyle && equalBinaryExp.Left is MemberExpression equalBinaryExpLeft &&
+                            _table.ColumnsByCs.TryGetValue(equalBinaryExpLeft.Member.Name, out var col) &&
+                            col.Attribute.MapType.IsArray && equalBinaryExp.Right.CanDynamicInvoke())
+                        {
+                            var memberValue = _commonUtils.GetNoneParamaterSqlValue(_params, "u", col, col.Attribute.MapType, Expression.Lambda(equalBinaryExp.Right).Compile().DynamicInvoke());
+                            _setIncr.Append(", ").Append(_commonUtils.QuoteSqlName(col.Attribute.Name)).Append(" = ").Append(memberValue);
+                            return this;
+                        }
+                        var eqval = _commonExpression.ExpressionWhereLambdaNoneForeignObject(null, null, _table, null, body, null, null);
+                        if (eqval.EndsWith("  IS  NULL")) eqval = $"{eqval.Remove(eqval.Length - 10)} = NULL"; //#311
+                        _set.Append(", ").Append(eqval);
+                        return this;
+                    }
                 case ExpressionType.MemberInit:
-                    var initExp = body as MemberInitExpression;
-                    if (initExp.Bindings?.Count > 0)
                     {
-                        for (var a = 0; a < initExp.Bindings.Count; a++)
+                        var initExp = body as MemberInitExpression;
+                        if (initExp.Bindings?.Count > 0)
                         {
-                            var initAssignExp = (initExp.Bindings[a] as MemberAssignment);
-                            if (initAssignExp == null) continue;
-                            var memberName = initExp.Bindings[a].Member.Name;
-                            if (_table.ColumnsByCsIgnore.ContainsKey(memberName)) continue;
-                            if (_table.ColumnsByCs.TryGetValue(memberName, out var col) == false) throw new Exception($"找不到属性：{memberName}");
-                            var memberValue = _commonExpression.ExpressionLambdaToSql(initAssignExp.Expression, new CommonExpression.ExpTSC { isQuoteName = true, 
-                                mapType = initAssignExp.Expression is BinaryExpression ? null : col.Attribute.MapType });
-                            _setIncr.Append(", ").Append(_commonUtils.QuoteSqlName(col.Attribute.Name)).Append(" = ").Append(memberValue);
+                            for (var a = 0; a < initExp.Bindings.Count; a++)
+                            {
+                                var initAssignExp = (initExp.Bindings[a] as MemberAssignment);
+                                if (initAssignExp == null) continue;
+                                var memberName = initExp.Bindings[a].Member.Name;
+                                if (_table.ColumnsByCsIgnore.ContainsKey(memberName)) continue;
+                                if (_table.ColumnsByCs.TryGetValue(memberName, out var col) == false) throw new Exception(CoreErrorStrings.NotFound_Property(memberName));
+                                var memberValue = isPgsqlStyle && col.Attribute.MapType.IsArray && initAssignExp.Expression.CanDynamicInvoke() ?
+                                    _commonUtils.GetNoneParamaterSqlValue(_params, "u", col, col.Attribute.MapType, Expression.Lambda(initAssignExp.Expression).Compile().DynamicInvoke()) :
+                                    _commonExpression.ExpressionLambdaToSql(initAssignExp.Expression, new CommonExpression.ExpTSC
+                                    {
+                                        isQuoteName = true,
+                                        mapType = initAssignExp.Expression is BinaryExpression ? null : col.Attribute.MapType
+                                    });
+                                _setIncr.Append(", ").Append(_commonUtils.QuoteSqlName(col.Attribute.Name)).Append(" = ").Append(memberValue);
+                            }
                         }
+                        return this;
                     }
-                    return this;
                 case ExpressionType.New:
-                    var newExp = body as NewExpression;
-                    if (newExp.Members?.Count > 0)
                     {
-                        for (var a = 0; a < newExp.Members.Count; a++)
+                        var newExp = body as NewExpression;
+                        if (newExp.Members?.Count > 0)
                         {
-                            var memberName = newExp.Members[a].Name;
-                            if (_table.ColumnsByCsIgnore.ContainsKey(memberName)) continue;
-                            if (_table.ColumnsByCs.TryGetValue(memberName, out var col) == false) throw new Exception($"找不到属性：{memberName}");
-                            var memberValue = _commonExpression.ExpressionLambdaToSql(newExp.Arguments[a], new CommonExpression.ExpTSC { isQuoteName = true, 
-                                mapType = newExp.Arguments[a] is BinaryExpression ? null : col.Attribute.MapType });
-                            _setIncr.Append(", ").Append(_commonUtils.QuoteSqlName(col.Attribute.Name)).Append(" = ").Append(memberValue);
+                            for (var a = 0; a < newExp.Members.Count; a++)
+                            {
+                                var memberName = newExp.Members[a].Name;
+                                if (_table.ColumnsByCsIgnore.ContainsKey(memberName)) continue;
+                                if (_table.ColumnsByCs.TryGetValue(memberName, out var col) == false) throw new Exception(CoreErrorStrings.NotFound_Property(memberName));
+                                var memberValue = isPgsqlStyle && col.Attribute.MapType.IsArray && newExp.Arguments[a].CanDynamicInvoke() ?
+                                    _commonUtils.GetNoneParamaterSqlValue(_params, "u", col, col.Attribute.MapType, Expression.Lambda(newExp.Arguments[a]).Compile().DynamicInvoke()) : 
+                                    _commonExpression.ExpressionLambdaToSql(newExp.Arguments[a], new CommonExpression.ExpTSC
+                                    {
+                                        isQuoteName = true,
+                                        mapType = newExp.Arguments[a] is BinaryExpression ? null : col.Attribute.MapType
+                                    });
+                                _setIncr.Append(", ").Append(_commonUtils.QuoteSqlName(col.Attribute.Name)).Append(" = ").Append(memberValue);
+                            }
                         }
+                        return this;
                     }
-                    return this;
             }
             if (body is BinaryExpression == false &&
                 nodeType != ExpressionType.Call) return this;
             var cols = new List<SelectColumnInfo>();
-            var expt = _commonExpression.ExpressionWhereLambdaNoneForeignObject(null, _table, cols, body, null, null);
+            var expt = _commonExpression.ExpressionWhereLambdaNoneForeignObject(null, null, _table, cols, body, null, null);
             if (cols.Any() == false) return this;
             foreach (var col in cols)
             {
@@ -594,6 +793,11 @@ namespace FreeSql.Internal.CommonProvider
                     if (replval == null) continue;
                     var replname = _commonUtils.QuoteSqlName(col.Column.Attribute.Name);
                     expt = expt.Replace(replname, _commonUtils.IsNull(replname, _commonUtils.FormatSql("{0}", replval)));
+                } 
+                else if (col.Column.CsType == typeof(string))
+                {
+                    var replname = _commonUtils.QuoteSqlName(col.Column.Attribute.Name);
+                    expt = expt.Replace(replname, _commonUtils.IsNull(replname, _commonUtils.FormatSql("{0}", "")));
                 }
             }
             _setIncr.Append(", ").Append(_commonUtils.QuoteSqlName(cols.First().Column.Attribute.Name)).Append(" = ").Append(expt);
@@ -608,14 +812,17 @@ namespace FreeSql.Internal.CommonProvider
             return this;
         }
 
-        public IUpdate<T1> SetDto(object dto)
-        {
+        public IUpdate<T1> SetDto(object dto) => SetDtoIgnore(dto, val => false);
+        public IUpdate<T1> SetDtoIgnore(object dto, Func<object, bool> ignore = null)
+		{
             if (dto == null) return this;
+            if (ignore == null) ignore = val => val == null;
             if (dto is Dictionary<string, object>)
             {
                 var dic = dto as Dictionary<string, object>;
                 foreach (var kv in dic)
                 {
+                    if (ignore(kv.Value)) continue;
                     if (_table.ColumnsByCs.TryGetValue(kv.Key, out var trycol) == false) continue;
                     if (_ignore.ContainsKey(trycol.Attribute.Name)) continue;
                     SetPriv(trycol, kv.Value);
@@ -625,9 +832,11 @@ namespace FreeSql.Internal.CommonProvider
             var dtoProps = dto.GetType().GetProperties();
             foreach (var dtoProp in dtoProps)
             {
-                if (_table.ColumnsByCs.TryGetValue(dtoProp.Name, out var trycol) == false) continue;
+                var val = dtoProp.GetValue(dto, null);
+				if (ignore(val)) continue;
+				if (_table.ColumnsByCs.TryGetValue(dtoProp.Name, out var trycol) == false) continue;
                 if (_ignore.ContainsKey(trycol.Attribute.Name)) continue;
-                SetPriv(trycol, dtoProp.GetValue(dto, null));
+                SetPriv(trycol, val);
             }
             return this;
         }
@@ -636,7 +845,7 @@ namespace FreeSql.Internal.CommonProvider
         public IUpdate<T1> WhereIf(bool condition, Expression<Func<T1, bool>> exp)
         {
             if (condition == false || exp == null) return this;
-            return this.Where(_commonExpression.ExpressionWhereLambdaNoneForeignObject(null, _table, null, exp?.Body, null, _params));
+            return this.Where(_commonExpression.ExpressionWhereLambdaNoneForeignObject(null, null, _table, null, exp?.Body, null, _params));
         }
         public IUpdate<T1> Where(string sql, object parms = null)
         {
@@ -646,12 +855,21 @@ namespace FreeSql.Internal.CommonProvider
             return this;
         }
         public IUpdate<T1> Where(T1 item) => this.Where(new[] { item });
-        public IUpdate<T1> Where(IEnumerable<T1> items) => this.Where(_commonUtils.WhereItems(_table.Primarys, "", items));
+        public IUpdate<T1> Where(IEnumerable<T1> items) => this.Where(_commonUtils.WhereItems(_table.Primarys, "", items, _params));
         public IUpdate<T1> WhereDynamic(object dywhere, bool not = false) => not == false ?
-            this.Where(_commonUtils.WhereObject(_table, "", dywhere)) :
-            this.Where($"not({_commonUtils.WhereObject(_table, "", dywhere)})");
+            this.Where(_commonUtils.WhereObject(_table, "", dywhere, _params)) :
+            this.Where($"not({_commonUtils.WhereObject(_table, "", dywhere, _params)})");
+		public IUpdate<T1> WhereDynamicFilter(DynamicFilterInfo filter)
+		{
+			var alias = "t_" + Guid.NewGuid().ToString("n").Substring(0, 8);
+			var tempQuery = _orm.Select<object>().AsType(_table.Type).DisableGlobalFilter().As(alias);
+			tempQuery.WhereDynamicFilter(filter);
+			var where = (tempQuery as Select0Provider)._where.ToString().Replace(alias + ".", "");
+			_where.Append(where);
+			return this;
+		}
 
-        public IUpdate<T1> DisableGlobalFilter(params string[] name)
+		public IUpdate<T1> DisableGlobalFilter(params string[] name)
         {
             if (_whereGlobalFilter.Any() == false) return this;
             if (name?.Any() != true)
@@ -672,7 +890,7 @@ namespace FreeSql.Internal.CommonProvider
         protected string WhereCaseSource(string CsName, Func<string, string> thenValue)
         {
             if (_source.Any() == false) return null;
-            if (_table.ColumnsByCs.ContainsKey(CsName) == false) throw new Exception($"找不到 {CsName} 对应的列");
+            if (_table.ColumnsByCs.ContainsKey(CsName) == false) throw new Exception(CoreErrorStrings.NotFound_CsName_Column(CsName));
             if (thenValue == null) throw new ArgumentNullException(nameof(thenValue));
 
             if (_source.Count == 0) return null;
@@ -699,22 +917,33 @@ namespace FreeSql.Internal.CommonProvider
                 var sb = new StringBuilder();
                 sb.Append(_commonUtils.QuoteSqlName(col.Attribute.Name)).Append(" = ");
 
-                var nulls = 0;
-                var cwsb = new StringBuilder().Append(cw);
-                foreach (var d in _source)
+                var valsameIf = col.Attribute.MapType.IsNumberType() ||
+                    new[] { typeof(string), typeof(DateTime), typeof(DateTime?) }.Contains(col.Attribute.MapType) ||
+                    col.Attribute.MapType.NullableTypeOrThis().IsEnum;
+                var ds = _source.Select(a => col.GetDbValue(a)).ToArray();
+                if (valsameIf == false && ds[0] == null) valsameIf = true;
+                if (valsameIf && ds.All(a => object.Equals(a, ds[0])))
                 {
-                    cwsb.Append(" \r\nWHEN ");
-                    ToSqlWhen(cwsb, _tempPrimarys, d);
-                    cwsb.Append(" THEN ");
-                    var val = col.GetDbValue(d);
-                    cwsb.Append(thenValue(_commonUtils.RewriteColumn(col, _commonUtils.GetNoneParamaterSqlValue(_paramsSource, "u", col, col.Attribute.MapType, val))));
-                    if (val == null || val == DBNull.Value) nulls++;
+                    var val = ds.First();
+                    var colsql = thenValue(_commonUtils.RewriteColumn(col, _commonUtils.GetNoneParamaterSqlValue(_paramsSource, "u", col, col.Attribute.MapType, val)));
+                    sb.Append(colsql);
                 }
-                cwsb.Append(" END");
-                if (nulls == _source.Count) sb.Append("NULL");
-                else sb.Append(cwsb);
-                cwsb.Clear();
-
+                else
+                {
+                    var cwsb = new StringBuilder().Append(cw);
+                    foreach (var d in _source)
+                    {
+                        cwsb.Append(" \r\nWHEN ");
+                        ToSqlWhen(cwsb, _tempPrimarys, d);
+                        cwsb.Append(" THEN ");
+                        var val = col.GetDbValue(d);
+                        var colsql = thenValue(_commonUtils.RewriteColumn(col, _commonUtils.GetNoneParamaterSqlValue(_paramsSource, "u", col, col.Attribute.MapType, val)));
+                        cwsb.Append(colsql);
+                    }
+                    cwsb.Append(" END");
+                    sb.Append(cwsb);
+                    cwsb.Clear();
+                }
                 return sb.ToString();
             }
         }
@@ -725,7 +954,8 @@ namespace FreeSql.Internal.CommonProvider
 
         protected string TableRuleInvoke()
         {
-            if (_tableRule == null && _table.AsTableImpl == null) return _table.DbName;
+            if (_tableRule == null && _table.AsTableImpl == null) return _commonUtils.GetEntityTableAopName(_table, true);
+            var tbname = _table?.DbName ?? "";
             string newname = null;
             if (_table.AsTableImpl != null)
             {
@@ -734,15 +964,15 @@ namespace FreeSql.Internal.CommonProvider
                 else if (_tableRule == null)
                     newname = _table.AsTableImpl.GetTableNameByColumnValue(DateTime.Now);
                 else
-                    newname = _tableRule(_table.DbName);
+                    newname = _tableRule(tbname);
             }
             else
-                newname = _tableRule(_table.DbName);
-            if (newname == _table.DbName) return _table.DbName;
-            if (string.IsNullOrEmpty(newname)) return _table.DbName;
+                newname = _tableRule(tbname);
+            if (newname == tbname) return tbname;
+            if (string.IsNullOrEmpty(newname)) return tbname;
             if (_orm.CodeFirst.IsSyncStructureToLower) newname = newname.ToLower();
             if (_orm.CodeFirst.IsSyncStructureToUpper) newname = newname.ToUpper();
-            if (_orm.CodeFirst.IsAutoSyncStructure) _orm.CodeFirst.SyncStructure(_table.Type, newname);
+            if (_isAutoSyncStructure) _orm.CodeFirst.SyncStructure(_table.Type, newname);
             return newname;
         }
         public IUpdate<T1> AsTable(Func<string, string> tableRule)
@@ -757,12 +987,13 @@ namespace FreeSql.Internal.CommonProvider
         }
         public IUpdate<T1> AsType(Type entityType)
         {
-            if (entityType == typeof(object)) throw new Exception("IUpdate.AsType 参数不支持指定为 object");
+            if (entityType == typeof(object)) throw new Exception(CoreErrorStrings.TypeAsType_NotSupport_Object("IUpdate"));
             if (entityType == _table.Type) return this;
             var newtb = _commonUtils.GetTableByEntity(entityType);
-            _table = newtb ?? throw new Exception("IUpdate.AsType 参数错误，请传入正确的实体类型");
+            _table = newtb ?? throw new Exception(CoreErrorStrings.Type_AsType_Parameter_Error("IUpdate"));
             _tempPrimarys = _table.Primarys;
-            if (_orm.CodeFirst.IsAutoSyncStructure) _orm.CodeFirst.SyncStructure(entityType);
+            _versionColumn = _ignoreVersion ? null : _table.VersionColumn;
+            if (_isAutoSyncStructure) _orm.CodeFirst.SyncStructure(entityType);
             IgnoreCanUpdate();
             return this;
         }
@@ -784,6 +1015,7 @@ namespace FreeSql.Internal.CommonProvider
                 sb2.Append(sql).Append("\r\n\r\n;\r\n\r\n");
             });
             if (sb2.Length > 0) sb2.Remove(sb2.Length - 9, 9);
+            if (sb2.Length == 0) return null;
             return sb2.ToString();
         }
 
@@ -793,23 +1025,26 @@ namespace FreeSql.Internal.CommonProvider
             {
                 var sb1 = new StringBuilder();
                 ToSqlExtension110(sb1, false);
-                fetch(sb1);
+                if (sb1.Length > 0) fetch(sb1);
                 return;
             }
             if (_where.Length == 0) return;
-            var newwhere = new StringBuilder();
+			if (_set.Length == 0 && _setIncr.Length == 0) return;
+			var newwhere = new StringBuilder();
             ToSqlWhere(newwhere);
 
             var sb = new StringBuilder();
-            if (_table.AsTableImpl != null)
+            if (_table.AsTableImpl != null && string.IsNullOrWhiteSpace(_tableRule?.Invoke(_table.DbName)) == true)
             {
-                var names = _table.AsTableImpl.GetTableNamesBySqlWhere(newwhere.ToString(), _params, new SelectTableInfo { Table = _table }, _commonUtils);
+                var oldTableRule = _tableRule;
+                var names = _table.AsTableImpl.GetTableNamesBySqlWhere(newwhere.ToString(), _params, new SelectTableInfo { Table = _table }, _commonUtils).Names;
                 foreach (var name in names)
                 {
                     _tableRule = old => name;
                     ToSqlExtension110(sb.Clear(), true);
                     fetch(sb);
                 }
+                _tableRule = oldTableRule;
                 return;
             }
 
@@ -824,24 +1059,27 @@ namespace FreeSql.Internal.CommonProvider
             {
                 var sb1 = new StringBuilder();
                 ToSqlExtension110(sb1, false);
-                await fetchAsync(sb1);
+				if (sb1.Length > 0) await fetchAsync(sb1);
                 sb1.Clear();
                 return;
             }
             if (_where.Length == 0) return;
+			if (_set.Length == 0 && _setIncr.Length == 0) return;
             var newwhere = new StringBuilder();
             ToSqlWhere(newwhere);
 
             var sb = new StringBuilder();
-            if (_table.AsTableImpl != null)
+            if (_table.AsTableImpl != null && string.IsNullOrWhiteSpace(_tableRule?.Invoke(_table.DbName)) == true)
             {
-                var names = _table.AsTableImpl.GetTableNamesBySqlWhere(newwhere.ToString(), _params, new SelectTableInfo { Table = _table }, _commonUtils);
+                var oldTableRule = _tableRule;
+                var names = _table.AsTableImpl.GetTableNamesBySqlWhere(newwhere.ToString(), _params, new SelectTableInfo { Table = _table }, _commonUtils).Names;
                 foreach (var name in names)
                 {
                     _tableRule = old => name;
                     ToSqlExtension110(sb.Clear(), true);
                     await fetchAsync(sb);
                 }
+                _tableRule = oldTableRule;
                 return;
             }
 
@@ -850,9 +1088,10 @@ namespace FreeSql.Internal.CommonProvider
             sb.Clear();
         }
 #endif
-        public virtual void ToSqlExtension110(StringBuilder sb, bool isAsTableSplited)
+		public virtual void ToSqlExtension110(StringBuilder sb, bool isAsTableSplited)
         {
             if (_where.Length == 0 && _source.Any() == false) return;
+            if (_source.Any() == false && _set.Length == 0 && _setIncr.Length == 0) return;
 
             if (_table.AsTableImpl != null && isAsTableSplited == false && _source == _sourceOld && _source.Any())
             {
@@ -912,7 +1151,11 @@ namespace FreeSql.Internal.CommonProvider
                         ++colidx;
                     }
                 }
-                if (colidx == 0) return;
+                if (colidx == 0)
+                {
+                    sb.Clear();
+                    return;
+                }
 
             }
             else if (_source.Count > 1)
@@ -939,30 +1182,42 @@ namespace FreeSql.Internal.CommonProvider
                             sb.Append(col.DbUpdateValue);
                         else
                         {
-                            var nulls = 0;
-                            var cwsb = new StringBuilder().Append(cw);
-                            foreach (var d in _source)
+                            var valsameIf = col.Attribute.MapType.IsNumberType() || 
+                                new[] { typeof(string), typeof(DateTime), typeof(DateTime?) }.Contains(col.Attribute.MapType) ||
+                                col.Attribute.MapType.NullableTypeOrThis().IsEnum;
+                            var ds = _source.Select(a => col.GetDbValue(a)).ToArray();
+							if (valsameIf == false && ds[0] == null) valsameIf = true;
+							if (valsameIf && ds.All(a => object.Equals(a, ds[0])))
                             {
-                                cwsb.Append(" \r\nWHEN ");
-                                ToSqlWhen(cwsb, _tempPrimarys, d);
-                                cwsb.Append(" THEN ");
-                                var val = col.GetDbValue(d);
-
+                                var val = ds.First();
                                 var colsql = _noneParameter ? _commonUtils.GetNoneParamaterSqlValue(_paramsSource, "u", col, col.Attribute.MapType, val) :
                                     _commonUtils.QuoteWriteParamterAdapter(col.Attribute.MapType, _commonUtils.QuoteParamterName($"p_{_paramsSource.Count}"));
-                                cwsb.Append(_commonUtils.RewriteColumn(col, colsql));
+                                sb.Append(_commonUtils.RewriteColumn(col, colsql));
                                 if (_noneParameter == false)
                                     _commonUtils.AppendParamter(_paramsSource, null, col, col.Attribute.MapType, val);
-                                if (val == null || val == DBNull.Value) nulls++;
                             }
-                            cwsb.Append(" END");
-                            if (nulls == _source.Count) sb.Append("NULL");
                             else
                             {
+                                var cwsb = new StringBuilder().Append(cw);
+                                foreach (var d in _source)
+                                {
+                                    cwsb.Append(" \r\nWHEN ");
+                                    ToSqlWhen(cwsb, _tempPrimarys, d);
+                                    cwsb.Append(" THEN ");
+                                    var val = col.GetDbValue(d);
+
+                                    var colsql = _noneParameter ? _commonUtils.GetNoneParamaterSqlValue(_paramsSource, "u", col, col.Attribute.MapType, val) :
+                                        _commonUtils.QuoteWriteParamterAdapter(col.Attribute.MapType, _commonUtils.QuoteParamterName($"p_{_paramsSource.Count}"));
+                                    colsql = _commonUtils.RewriteColumn(col, colsql);
+                                    cwsb.Append(colsql);
+                                    if (_noneParameter == false)
+                                        _commonUtils.AppendParamter(_paramsSource, null, col, col.Attribute.MapType, val);
+                                }
+                                cwsb.Append(" END");
                                 ToSqlCaseWhenEnd(cwsb, col);
                                 sb.Append(cwsb);
+                                cwsb.Clear();
                             }
-                            cwsb.Clear();
                         }
                         ++colidx;
                     }
@@ -973,25 +1228,54 @@ namespace FreeSql.Internal.CommonProvider
                 return;
 
             if (_setIncr.Length > 0)
-                sb.Append(_set.Length > 0 ? _setIncr.ToString() : _setIncr.ToString().Substring(2));
+                sb.Append(_set.Length > 0 || _source.Any() ? _setIncr.ToString() : _setIncr.ToString().Substring(2));
 
             if (_source.Any() == false)
             {
+                var sbString = "";
                 foreach (var col in _table.Columns.Values)
                     if (col.Attribute.CanUpdate && string.IsNullOrEmpty(col.DbUpdateValue) == false)
-                        sb.Append(", ").Append(_commonUtils.QuoteSqlName(col.Attribute.Name)).Append(" = ").Append(col.DbUpdateValue);
+                    {
+                        if (sbString == "") sbString = sb.ToString();
+                        var loc3 = _commonUtils.QuoteSqlName(col.Attribute.Name);
+                        if (sbString.Contains(loc3)) continue;
+                        sb.Append(", ").Append(loc3).Append(" = ").Append(col.DbUpdateValue);
+                    }
             }
 
-            if (_table.VersionColumn != null)
+            if (_versionColumn != null && _versionColumn.Attribute.CanUpdate)
             {
-                var vcname = _commonUtils.QuoteSqlName(_table.VersionColumn.Attribute.Name);
-                if (_table.VersionColumn.Attribute.MapType == typeof(byte[]))
+                var vcname = _commonUtils.QuoteSqlName(_versionColumn.Attribute.Name);
+                var vcvalue = vcname;
+                if (string.IsNullOrWhiteSpace(_tableAlias) == false)
+                {
+                    switch (_orm.Ado.DataType)
+                    {
+                        case DataType.PostgreSQL:
+                        case DataType.OdbcPostgreSQL:
+                        case DataType.CustomPostgreSQL:
+                        case DataType.KingbaseES:
+                        case DataType.ShenTong:
+                        case DataType.Xugu:
+                            vcvalue = $"{_tableAlias}.{vcname}";  //set name = b.name
+                            break;
+                        default:
+                            vcname = vcvalue = $"{_tableAlias}.{vcname}";  //set a.name = b.name
+                            break;
+                    }
+                }
+                if (_versionColumn.Attribute.MapType == typeof(byte[]))
                 {
                     _updateVersionValue = Utils.GuidToBytes(Guid.NewGuid());
-                    sb.Append(", ").Append(vcname).Append(" = ").Append(_commonUtils.GetNoneParamaterSqlValue(_paramsSource, "uv", _table.VersionColumn, _table.VersionColumn.Attribute.MapType, _updateVersionValue));
+                    sb.Append(", ").Append(vcname).Append(" = ").Append(_commonUtils.GetNoneParamaterSqlValue(_paramsSource, "uv", _versionColumn, _versionColumn.Attribute.MapType, _updateVersionValue));
+                }
+                else if (_versionColumn.Attribute.MapType == typeof(string))
+                {
+                    _updateVersionValue = Guid.NewGuid().ToString();
+                    sb.Append(", ").Append(vcname).Append(" = ").Append(_commonUtils.GetNoneParamaterSqlValue(_paramsSource, "uv", _versionColumn, _versionColumn.Attribute.MapType, _updateVersionValue));
                 }
                 else
-                    sb.Append(", ").Append(vcname).Append(" = ").Append(_commonUtils.IsNull(vcname, 0)).Append(" + 1");
+                    sb.Append(", ").Append(vcname).Append(" = ").Append(_commonUtils.IsNull(vcvalue, 0)).Append(" + 1");
             }
             ToSqlWhere(sb);
             _interceptSql?.Invoke(sb);
@@ -1000,26 +1284,46 @@ namespace FreeSql.Internal.CommonProvider
 
         public virtual void ToSqlWhere(StringBuilder sb)
         {
+            var andTimes = 0;
             sb.Append(" \r\nWHERE ");
             if (_source.Any())
             {
-                if (_tempPrimarys.Any() == false) throw new ArgumentException($"{_table.Type.DisplayCsharp()} 没有定义主键，无法使用 SetSource，请尝试 SetDto");
-                sb.Append('(').Append(_commonUtils.WhereItems(_tempPrimarys, "", _source)).Append(')');
+                if (_tempPrimarys.Any() == false) throw new ArgumentException(CoreErrorStrings.NoPrimaryKey_UseSetDto(_table.Type.DisplayCsharp()));
+                sb.Append('(').Append(_commonUtils.WhereItems(_tempPrimarys, "", _source, _paramsSource)).Append(')');
+                andTimes++;
             }
-
-            if (_where.Length > 0)
-                sb.Append(_source.Any() ? _where.ToString() : _where.ToString().Substring(5));
 
             if (_whereGlobalFilter.Any())
             {
-                var globalFilterCondi = _commonExpression.GetWhereCascadeSql(new SelectTableInfo { Table = _table }, _whereGlobalFilter, false);
+                var globalFilterCondi = _commonExpression.GetWhereCascadeSql(new SelectTableInfo { Table = _table, Alias = _tableAlias }, _whereGlobalFilter.Where(a => a.Before == true), false);
                 if (string.IsNullOrEmpty(globalFilterCondi) == false)
-                    sb.Append(" AND ").Append(globalFilterCondi);
+                {
+                    if (andTimes > 0) sb.Append(" AND ");
+                    sb.Append(globalFilterCondi);
+                    andTimes++;
+                }
             }
 
-            if (_table.VersionColumn != null)
+            if (_where.Length > 0)
             {
-                var versionCondi = WhereCaseSource(_table.VersionColumn.CsName, sqlval => sqlval);
+                sb.Append(andTimes > 0 ? _where.ToString() : _where.ToString().Substring(5));
+                andTimes++;
+            }
+
+            if (_whereGlobalFilter.Any())
+            {
+                var globalFilterCondi = _commonExpression.GetWhereCascadeSql(new SelectTableInfo { Table = _table, Alias = _tableAlias }, _whereGlobalFilter.Where(a => a.Before == false), false);
+                if (string.IsNullOrEmpty(globalFilterCondi) == false)
+                {
+                    if (andTimes > 0) sb.Append(" AND ");
+                    sb.Append(globalFilterCondi);
+                    andTimes++;
+                }
+            }
+
+            if (_versionColumn != null)
+            {
+                var versionCondi = WhereCaseSource(_versionColumn.CsName, sqlval => sqlval);
                 if (string.IsNullOrEmpty(versionCondi) == false)
                     sb.Append(" AND ").Append(versionCondi);
             }
